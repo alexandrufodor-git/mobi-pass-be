@@ -1,6 +1,6 @@
 // supabase/functions/_shared/ioHelpers.ts
 
-import { Errors, badRequest } from "./constants.ts"
+import { Errors, badRequest, getCorsHeaders } from "./constants.ts"
 
 // Types
 export interface ParsedFile {
@@ -14,11 +14,22 @@ export interface MultipartResult {
   fields: Record<string, string>
 }
 
-// Helper to return JSON response
-export function json(obj: unknown, status = 200): Response {
+// Helper to handle CORS preflight OPTIONS requests
+export function corsResponse(origin?: string): Response {
+  return new Response(null, {
+    status: 204,
+    headers: getCorsHeaders(origin),
+  })
+}
+
+// Helper to return JSON response with CORS headers
+export function json(obj: unknown, status = 200, origin?: string): Response {
   return new Response(JSON.stringify(obj), {
     status,
-    headers: { "content-type": "application/json" },
+    headers: {
+      "content-type": "application/json",
+      ...getCorsHeaders(origin),
+    },
   })
 }
 

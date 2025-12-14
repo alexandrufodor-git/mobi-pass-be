@@ -2,18 +2,26 @@
 import "jsr:@supabase/functions-js/edge-runtime.d.ts"
 import { requireRole } from "../_shared/guard.ts"
 import { Errors, UserRoles, badRequest, json } from "../_shared/constants.ts"
+import { corsResponse } from "../_shared/ioHelpers.ts"
 
 Deno.serve(async (req) => {
+  const origin = req.headers.get("origin") || undefined
+
+  // Handle CORS preflight
+  if (req.method === "OPTIONS") {
+    return corsResponse(origin)
+  }
+
   const SUPABASE_URL = Deno.env.get("SUPABASE_URL")!
   const SERVICE_KEY = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!
 
   // Only employees can register
-  await requireRole(req, SUPABASE_URL, SERVICE_KEY, [UserRoles.EMPLOYEE])
+  await requireRole(req, SUPABASE_URL, SERVICE_KEY, [UserRoles.EMPLOYEE], origin)
 
   // Get email from request body
   const { email } = await req.json()
   if (!email) {
-    return badRequest(Errors.EMAIL_REQUIRED)
+    return badRequest(Errors.EMAIL_REQUIRED, undefined, origin)
   }
 
   // Check if invite exists (case-insensitive)
@@ -29,7 +37,7 @@ Deno.serve(async (req) => {
 
   const invites = await inviteRes.json()
   if (!invites.length) {
-    return json(Errors.NOT_INVITED, 403)
+    return json(Errors.NOT_INVITED, 403, origin)
   }
 
   // Send OTP via Supabase Auth
@@ -47,10 +55,10 @@ Deno.serve(async (req) => {
 
   if (!otpRes.ok) {
     const error = await otpRes.json()
-    return json({ ...Errors.OTP_FAILED, details: error }, 500)
+    return json({ ...Errors.OTP_FAILED, details: error }, 500, origin)
   }
 
-  return json({ success: true, message: "OTP sent" })
+  return json({ success: true, message: "OTP sent" }, 200, origin)
 })
 
 /* To invoke locally:

@@ -1,5 +1,7 @@
 // supabase/functions/_shared/auth.ts
 
+import { invalidJwt } from "./constants.ts"
+
 export function decodeJwt(token: string | null): any | null {
   if (!token) return null
 
@@ -17,15 +19,12 @@ export function decodeJwt(token: string | null): any | null {
   }
 }
 
-export function requireJwt(req: Request) {
+export function requireJwt(req: Request, origin?: string) {
   const authHeader = req.headers.get("authorization")
   const jwt = decodeJwt(authHeader)
 
   if (!jwt?.sub) {
-    throw new Response(
-      JSON.stringify({ error: "invalid_jwt" }),
-      { status: 401 }
-    )
+    throw invalidJwt(undefined, origin)
   }
 
   return jwt

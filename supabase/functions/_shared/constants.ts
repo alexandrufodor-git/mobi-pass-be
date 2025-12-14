@@ -1,5 +1,14 @@
 // supabase/functions/_shared/constants.ts
 
+// CORS headers for cross-origin requests
+export function getCorsHeaders(origin?: string): Record<string, string> {
+  return {
+    "Access-Control-Allow-Origin": origin || "*",
+    "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS",
+    "Access-Control-Allow-Headers": "authorization, x-client-info, apikey, content-type",
+  }
+}
+
 export const UserRoles = {
   ADMIN: "admin",
   HR: "hr",
@@ -28,44 +37,44 @@ export const Errors = {
   OTP_FAILED: { error: "otp_send_failed" },
 } as const
 
-export function forbidden(error = Errors.FORBIDDEN): Response {
+export function forbidden(error = Errors.FORBIDDEN, origin?: string): Response {
   return new Response(
     JSON.stringify({ error: error.error, reason: error.reason }),
-    { status: 403, headers: { "content-type": "application/json" } }
+    { status: 403, headers: { "content-type": "application/json", ...getCorsHeaders(origin) } }
   )
 }
 
-export function invalidJwt(error = Errors.INVALID_JWT): Response {
+export function invalidJwt(error = Errors.INVALID_JWT, origin?: string): Response {
   return new Response(
     JSON.stringify({ error: error.error }),
-    { status: 401, headers: { "content-type": "application/json" } }
+    { status: 401, headers: { "content-type": "application/json", ...getCorsHeaders(origin) } }
   )
 }
 
-export function roleLookupFailed(error = Errors.ROLE_LOOKUP_FAILED): Response {
+export function roleLookupFailed(error = Errors.ROLE_LOOKUP_FAILED, origin?: string): Response {
   return new Response(
     JSON.stringify({ error: error.error }),
-    { status: 500, headers: { "content-type": "application/json" } }
+    { status: 500, headers: { "content-type": "application/json", ...getCorsHeaders(origin) } }
   )
 }
 
-export function badRequest(error: { error: string }, extra?: Record<string, unknown>): Response {
+export function badRequest(error: { error: string }, extra?: Record<string, unknown>, origin?: string): Response {
   return new Response(
     JSON.stringify({ ...error, ...extra }),
-    { status: 400, headers: { "content-type": "application/json" } }
+    { status: 400, headers: { "content-type": "application/json", ...getCorsHeaders(origin) } }
   )
 }
 
-export function notFound(path?: string): Response {
+export function notFound(path?: string, origin?: string): Response {
   return new Response(
     JSON.stringify({ ...Errors.NOT_FOUND, ...(path && { path }) }),
-    { status: 404, headers: { "content-type": "application/json" } }
+    { status: 404, headers: { "content-type": "application/json", ...getCorsHeaders(origin) } }
   )
 }
 
-export function json(obj: unknown, status = 200): Response {
+export function json(obj: unknown, status = 200, origin?: string): Response {
   return new Response(JSON.stringify(obj), {
     status,
-    headers: { "content-type": "application/json" },
+    headers: { "content-type": "application/json", ...getCorsHeaders(origin) },
   })
 }

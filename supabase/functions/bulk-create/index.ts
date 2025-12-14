@@ -3,18 +3,24 @@ console.info("bulk-create starting")
 
 import { requireRole } from "../_shared/guard.ts"
 import { Errors, badRequest, notFound } from "../_shared/constants.ts"
-import { json, getCsvFromRequest, parseCsv } from "../_shared/ioHelpers.ts"
+import { json, getCsvFromRequest, parseCsv, corsResponse } from "../_shared/ioHelpers.ts"
 
 // Main edge function
 Deno.serve(async (req: Request) => {
   const url = new URL(req.url)
   const path = url.pathname
   const method = req.method
+  const origin = req.headers.get("origin") || undefined
+
+  // Handle CORS preflight
+  if (method === "OPTIONS") {
+    return corsResponse(origin)
+  }
 
   const SUPABASE_URL = Deno.env.get("SUPABASE_URL")!
   const SERVICE_KEY = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!
 
-  const jwt = await requireRole(req, SUPABASE_URL, SERVICE_KEY)
+  const jwt = await requireRole(req, SUPABASE_URL, SERVICE_KEY, undefined, origin)
 
   // --- handle bulk-create ---
   if (path === "/bulk-create" && method === "POST") {
@@ -76,8 +82,8 @@ Deno.serve(async (req: Request) => {
       })
     }
 
-    return json({ created: results.length, results })
+    return json({ created: results.length, results }, 200, origin)
   }
 
-  return notFound(path)
+  return notFound(path, origin)
 })
