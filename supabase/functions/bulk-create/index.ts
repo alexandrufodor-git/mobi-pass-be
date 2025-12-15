@@ -29,7 +29,7 @@ Deno.serve(async (req: Request) => {
 
     const results: Array<{
       email: string
-      ok: boolean
+      invited: boolean,
       status?: string
       error?: string
       body?: unknown
@@ -37,7 +37,7 @@ Deno.serve(async (req: Request) => {
 
     for (const r of rows) {
       if (!r.email?.includes("@")) {
-        results.push({ email: r.email, ok: false, error: "invalid_email" })
+        results.push({ email: r.email, invited: false, error: "invalid_email" })
         continue
       }
 
@@ -55,7 +55,7 @@ Deno.serve(async (req: Request) => {
 
       const existing = await checkRes.json()
       if (existing.length > 0) {
-        results.push({ email: r.email, ok: true, status: "already_exists" })
+        results.push({ email: r.email, invited: false, status: "already_exists" })
         continue
       }
 
@@ -76,8 +76,7 @@ Deno.serve(async (req: Request) => {
       const newProfile = await insertRes.json()
       results.push({
         email: r.email,
-        ok: insertRes.ok,
-        status: insertRes.ok ? "created" : "error",
+        invited: true,
         body: newProfile,
       })
     }
