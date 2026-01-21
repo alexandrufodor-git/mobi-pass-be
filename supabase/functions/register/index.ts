@@ -1,7 +1,6 @@
 // Setup type definitions for built-in Supabase Runtime APIs
 import "jsr:@supabase/functions-js/edge-runtime.d.ts"
-import { requireRole } from "../_shared/guard.ts"
-import { Errors, UserRoles, badRequest, json } from "../_shared/constants.ts"
+import { Errors, badRequest, json } from "../_shared/constants.ts"
 import { corsResponse } from "../_shared/ioHelpers.ts"
 
 /**
@@ -82,6 +81,7 @@ Deno.serve(async (req) => {
   const otpRes = await fetch(`${SUPABASE_URL}/auth/v1/otp`, {
     method: "POST",
     headers: {
+      Authorization: `Bearer ${SERVICE_KEY}`,
       apikey: SERVICE_KEY,
       "Content-Type": "application/json",
     },

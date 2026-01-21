@@ -19,13 +19,22 @@ To apply or update triggers in your database:
 
 **Local Development:**
 ```bash
+# From project root
 psql -h localhost -p 54322 -U postgres -d postgres -f database/triggers/handle_user_registration.sql
+```
+
+Or using Supabase CLI:
+```bash
+# Connect to local database
+supabase db reset  # This will rerun all migrations
 ```
 
 **Production (via Supabase Dashboard):**
 1. Go to SQL Editor in your Supabase dashboard
 2. Copy the contents of the trigger file
 3. Paste and execute
+
+**Important:** After modifying trigger files, you need to reapply them to your database. The triggers are not automatically synced like migrations.
 
 ### Adding New Triggers
 

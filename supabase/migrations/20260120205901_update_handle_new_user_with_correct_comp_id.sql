@@ -1,19 +1,3 @@
--- ============================================================================
--- User Registration Trigger
--- ============================================================================
--- This trigger handles automatic user setup when a new user registers or
--- updates their password after OTP verification.
---
--- Actions performed:
--- 1. Assigns 'employee' role to new users
--- 2. Creates/updates profile record
--- 3. Sets profile_invites status to 'active'
---
--- Triggers:
--- - on_auth_user_created: Fires when user verifies OTP (email_confirmed_at set)
--- - on_auth_user_updated: Fires when user sets/changes password
--- ============================================================================
-
 -- Drop existing triggers if they exist
 DROP TRIGGER IF EXISTS on_auth_user_created ON auth.users;
 DROP TRIGGER IF EXISTS on_auth_user_updated ON auth.users;
@@ -50,7 +34,7 @@ BEGIN
     ON CONFLICT (user_id, role) DO NOTHING;
     
     -- 2. Create or update profile
-    INSERT INTO public.profiles (user_id, email, status)
+    INSERT INTO public.profiles (user_id, email, status, company_id)
     VALUES (NEW.id, NEW.email, 'active'::public.user_profile_status, v_company_id)
     ON CONFLICT (user_id) 
     DO UPDATE SET 

@@ -2,8 +2,8 @@
 console.info("bulk-create starting")
 
 import { requireRole } from "../_shared/guard.ts"
-import { Errors, badRequest, notFound } from "../_shared/constants.ts"
-import { json, getCsvFromRequest, parseCsv, corsResponse } from "../_shared/ioHelpers.ts"
+import { Errors, badRequest, notFound, json } from "../_shared/constants.ts"
+import { getCsvFromRequest, parseCsv, corsResponse } from "../_shared/ioHelpers.ts"
 
 // Main edge function
 Deno.serve(async (req: Request) => {
@@ -21,6 +21,31 @@ Deno.serve(async (req: Request) => {
   const SERVICE_KEY = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!
 
   const jwt = await requireRole(req, SUPABASE_URL, SERVICE_KEY, undefined, origin)
+
+  // Fetch the company_id from the logged-in HR user's profile
+  const profileRes = await fetch(
+    `${SUPABASE_URL}/rest/v1/profiles?user_id=eq.${jwt.sub}&select=company_id`,
+    {
+      headers: {
+        Authorization: `Bearer ${SERVICE_KEY}`,
+        apikey: SERVICE_KEY,
+      },
+    }
+  )
+
+  if (!profileRes.ok) {
+    return json(Errors.PROFILE_FETCH_FAILED, 500, origin)
+  }
+
+  const profiles = await profileRes.json()
+  if (!profiles || profiles.length === 0) {
+    return json(Errors.PROFILE_NOT_FOUND, 404, origin)
+  }
+
+  const companyId = profiles[0].company_id
+  if (!companyId) {
+    return badRequest(Errors.NO_COMPANY, undefined, origin)
+  }
 
   // --- handle bulk-create ---
   if (path === "/bulk-create" && method === "POST") {
@@ -70,6 +95,7 @@ Deno.serve(async (req: Request) => {
         },
         body: JSON.stringify({
           email: r.email,
+          company_id: companyId
         }),
       })
 

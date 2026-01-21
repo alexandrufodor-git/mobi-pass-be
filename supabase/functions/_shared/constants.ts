@@ -35,6 +35,10 @@ export const Errors = {
   NOT_INVITED: { error: "not_invited" },
   EMAIL_REQUIRED: { error: "email_required" },
   OTP_FAILED: { error: "otp_send_failed" },
+  // Profile/Company errors
+  PROFILE_FETCH_FAILED: { error: "profile_fetch_failed" },
+  PROFILE_NOT_FOUND: { error: "profile_not_found" },
+  NO_COMPANY: { error: "no_company_assigned" },
 } as const
 
 export function forbidden(error = Errors.FORBIDDEN, origin?: string): Response {
