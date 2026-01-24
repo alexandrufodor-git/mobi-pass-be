@@ -1,12 +1,12 @@
 -- ============================================================================
--- User Registration Trigger
+-- User Registration Trigger - Update to include bike benefit creation
 -- ============================================================================
--- This trigger handles automatic user setup when a new user registers or
--- updates their password after OTP verification.
+-- This migration updates the handle_user_registration trigger to also create
+-- a bike benefit record when a user registers.
 --
 -- Actions performed:
 -- 1. Assigns 'employee' role to new users
--- 2. Creates/updates profile record
+-- 2. Creates/updates profile record (also fixes company_id column bug)
 -- 3. Sets profile_invites status to 'active'
 -- 4. Creates a bike benefit record for the user
 --
@@ -50,7 +50,7 @@ BEGIN
     VALUES (NEW.id, 'employee'::public.user_role)
     ON CONFLICT (user_id, role) DO NOTHING;
     
-    -- 2. Create or update profile
+    -- 2. Create or update profile (fixed: added company_id to column list)
     INSERT INTO public.profiles (user_id, email, status, company_id)
     VALUES (NEW.id, NEW.email, 'active'::public.user_profile_status, v_company_id)
     ON CONFLICT (user_id) 
@@ -92,4 +92,3 @@ CREATE TRIGGER on_auth_user_updated
     OLD.encrypted_password IS DISTINCT FROM NEW.encrypted_password
   )
   EXECUTE FUNCTION public.handle_user_registration();
-
