@@ -2,22 +2,18 @@
 -- Enhance bikes table with detailed fields
 -- ============================================
 
--- Add bike type enum (only if it doesn't exist)
-DO $$ BEGIN
-  CREATE TYPE public.bike_type AS ENUM (
-    'e_mtb_hardtail_29',
-    'e_mtb_hardtail_27_5',
-    'e_full_suspension_29',
-    'e_full_suspension_27_5',
-    'e_city_bike',
-    'e_touring',
-    'e_road_race',
-    'e_cargo_bike',
-    'e_kids_24'
-  );
-EXCEPTION WHEN duplicate_object THEN
-  NULL; -- Type already exists, ignore
-END $$;
+-- Add bike type enum
+CREATE TYPE public.bike_type AS ENUM (
+  'e_mtb_hardtail_29',
+  'e_mtb_hardtail_27_5',
+  'e_full_suspension_29',
+  'e_full_suspension_27_5',
+  'e_city_bike',
+  'e_touring',
+  'e_road_race',
+  'e_cargo_bike',
+  'e_kids_24'
+);
 
 -- Add new columns to bikes table
 ALTER TABLE public.bikes

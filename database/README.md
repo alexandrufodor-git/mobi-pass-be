@@ -56,6 +56,13 @@ Automatically sets up new users when they register via OTP:
 - New user creation (OTP verification)
 - Password updates
 
+## Key Relationships
+
+### profile_invites → profiles
+- `profile_invites.user_id` links to `profiles.user_id` (nullable)
+- NULL before registration, populated by trigger during registration
+- Enables PostgREST: `profile_invites?select=*,profiles(*)`
+
 ## Notes
 
 - The `supabase/` folder is managed by Supabase CLI and should not be modified directly
