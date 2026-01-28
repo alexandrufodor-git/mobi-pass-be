@@ -6,19 +6,31 @@
 -- ============================================================================
 
 -- Clear existing data (in correct order to respect foreign keys)
+TRUNCATE TABLE public.bike_orders CASCADE;
+TRUNCATE TABLE public.bike_benefits CASCADE;
+TRUNCATE TABLE public.bikes CASCADE;
 TRUNCATE TABLE public.user_roles CASCADE;
 TRUNCATE TABLE public.profiles CASCADE;
 TRUNCATE TABLE public.profile_invites CASCADE;
+TRUNCATE TABLE public.companies CASCADE;
+
+-- ============================================================================
+-- Companies with benefit pricing
+-- ============================================================================
+INSERT INTO public.companies (id, name, description, monthly_benefit_subsidy, contract_months) VALUES
+  ('11111111-1111-1111-1111-111111111111'::uuid, '8x8', 'Communications company offering bike benefits', 72.00, 36),
+  ('22222222-2222-2222-2222-222222222222'::uuid, 'BigTech1', 'Large tech company with generous bike subsidy', 100.00, 36),
+  ('33333333-3333-3333-3333-333333333333'::uuid, 'SmallTech2', 'Startup with standard bike benefits', 50.00, 24);
 
 -- ============================================================================
 -- Profile Invites
 -- ============================================================================
 -- Add test invites so users can register via OTP
-INSERT INTO public.profile_invites (email, status) VALUES
-  ('test@example.com', 'inactive'),
-  ('admin@example.com', 'inactive'),
-  ('hr@example.com', 'inactive'),
-  ('someonestolemyyahoo@gmail.com', 'inactive');
+INSERT INTO public.profile_invites (email, status, company_id) VALUES
+  ('test@example.com', 'inactive', '11111111-1111-1111-1111-111111111111'::uuid),
+  ('admin@example.com', 'inactive', '11111111-1111-1111-1111-111111111111'::uuid),
+  ('hr@example.com', 'inactive', '11111111-1111-1111-1111-111111111111'::uuid),
+  ('someonestolemyyahoo@gmail.com', 'inactive', '22222222-2222-2222-2222-222222222222'::uuid);
 
 -- ============================================================================
 -- Notes for Testing
