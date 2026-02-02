@@ -48,9 +48,22 @@ Deno.serve(async (req: Request) => {
   }
 
   // --- handle bulk-create ---
-  if (path === "/bulk-create" && method === "POST") {
+  // When deployed, the path is "/" but locally it might be "/bulk-create"
+  if ((path === "/bulk-create" || path === "/") && method === "POST") {
     const csv = await getCsvFromRequest(req)
-    const rows = parseCsv<{ email: string }>(csv, ["email"])
+    
+    // Define the CSV row type with all possible fields
+    interface CsvRow {
+      email: string
+      firstName: string
+      lastName: string
+      description?: string
+      department?: string
+      hireDate?: string
+    }
+    
+    // Parse CSV - email, firstName, and lastName are required
+    const rows = parseCsv<CsvRow>(csv, ["email", "firstName", "lastName"])
 
     const results: Array<{
       email: string
@@ -61,8 +74,19 @@ Deno.serve(async (req: Request) => {
     }> = []
 
     for (const r of rows) {
+      // Validate email format
       if (!r.email?.includes("@")) {
         results.push({ email: r.email, invited: false, error: "invalid_email" })
+        continue
+      }
+
+      // Validate required fields
+      if (!r.firstName?.trim()) {
+        results.push({ email: r.email, invited: false, error: "missing_first_name" })
+        continue
+      }
+      if (!r.lastName?.trim()) {
+        results.push({ email: r.email, invited: false, error: "missing_last_name" })
         continue
       }
 
@@ -84,6 +108,44 @@ Deno.serve(async (req: Request) => {
         continue
       }
 
+      // --- prepare invite data ---
+      // Convert hireDate string to bigint (epoch milliseconds)
+      let hireDateValue: number | null = null
+      if (r.hireDate && r.hireDate.trim()) {
+        const dateStr = r.hireDate.trim()
+        
+        // Try parsing as epoch timestamp first
+        const parsedNum = parseInt(dateStr, 10)
+        if (!isNaN(parsedNum) && parsedNum > 0) {
+          hireDateValue = parsedNum
+        } else {
+          // Try parsing as date string (e.g., "1 Jan 2020", "2020-01-01")
+          const parsedDate = new Date(dateStr)
+          if (!isNaN(parsedDate.getTime())) {
+            hireDateValue = parsedDate.getTime()
+          }
+        }
+      }
+
+      // Build the invite payload - firstName and lastName are required
+      const inviteData: Record<string, unknown> = {
+        email: r.email,
+        company_id: companyId,
+        first_name: r.firstName.trim(),
+        last_name: r.lastName.trim()
+      }
+
+      // Add optional fields only if they have values
+      if (r.description && r.description.trim()) {
+        inviteData.description = r.description.trim()
+      }
+      if (r.department && r.department.trim()) {
+        inviteData.department = r.department.trim()
+      }
+      if (hireDateValue !== null) {
+        inviteData.hire_date = hireDateValue
+      }
+
       // --- insert new profile invite ---
       const insertRes = await fetch(`${SUPABASE_URL}/rest/v1/profile_invites`, {
         method: "POST",
@@ -93,10 +155,7 @@ Deno.serve(async (req: Request) => {
           "Content-Type": "application/json",
           Prefer: "return=representation",
         },
-        body: JSON.stringify({
-          email: r.email,
-          company_id: companyId
-        }),
+        body: JSON.stringify(inviteData),
       })
 
       const newProfile = await insertRes.json()

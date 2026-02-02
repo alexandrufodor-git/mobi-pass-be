@@ -138,6 +138,11 @@ export interface Profile {
   email: string;
   status: ProfileStatus;
   company_id: string;
+  first_name: string;
+  last_name: string;
+  description: string | null;
+  department: string | null;
+  hire_date: number | null; // Unix timestamp in milliseconds
   created_at: string;
 }
 
@@ -171,6 +176,13 @@ export interface ProfileInviteWithDetails {
   user_id: string | null;
   profile_status: ProfileStatus | null;
   registered_at: string | null;
+  
+  // Employee data (first_name and last_name are always present, others nullable)
+  first_name: string;
+  last_name: string;
+  description: string | null;
+  department: string | null;
+  hire_date: number | null;
   
   // Benefit data (null if not started)
   bike_benefit_id: string | null;

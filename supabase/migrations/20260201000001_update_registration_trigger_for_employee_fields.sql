@@ -1,19 +1,8 @@
--- ============================================================================
--- User Registration Trigger
--- ============================================================================
--- This trigger handles automatic user setup when a new user registers or
--- updates their password after OTP verification.
---
--- Actions performed:
--- 1. Assigns 'employee' role to new users
--- 2. Creates/updates profile record
--- 3. Sets profile_invites status to 'active'
--- 4. Creates a bike benefit record for the user
---
--- Triggers:
--- - on_auth_user_created: Fires when user verifies OTP (email_confirmed_at set)
--- - on_auth_user_updated: Fires when user sets/changes password
--- ============================================================================
+-- ============================================
+-- Migration: Update user registration trigger to copy employee fields
+-- Created: 2026-02-01
+-- Description: Update handle_user_registration to copy firstName, lastName, description, department, and hireDate
+-- ============================================
 
 -- Drop existing triggers if they exist
 DROP TRIGGER IF EXISTS on_auth_user_created ON auth.users;
@@ -118,6 +107,7 @@ END;
 $$ LANGUAGE plpgsql SECURITY DEFINER;
 
 -- Create trigger for new user creation (when OTP is verified AND password is set)
+-- This ensures the trigger only fires when registration is COMPLETE
 CREATE TRIGGER on_auth_user_created
   AFTER INSERT ON auth.users
   FOR EACH ROW
@@ -125,6 +115,7 @@ CREATE TRIGGER on_auth_user_created
   EXECUTE FUNCTION public.handle_user_registration();
 
 -- Create trigger for user updates (when password is set/changed)
+-- This handles cases where user verifies email first, then sets password later
 CREATE TRIGGER on_auth_user_updated
   AFTER UPDATE ON auth.users
   FOR EACH ROW
@@ -134,4 +125,3 @@ CREATE TRIGGER on_auth_user_updated
     OLD.encrypted_password IS DISTINCT FROM NEW.encrypted_password
   )
   EXECUTE FUNCTION public.handle_user_registration();
-
