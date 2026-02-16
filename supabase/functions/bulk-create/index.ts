@@ -10,9 +10,10 @@ Deno.serve(async (req: Request) => {
   const url = new URL(req.url)
   const path = url.pathname
   const method = req.method
-  const origin = req.headers.get("origin") || undefined
+  const origin = req.headers.get("origin") || ''
 
   // Handle CORS preflight
+  // Check to able to make the request
   if (method === "OPTIONS") {
     return corsResponse(origin)
   }
@@ -23,6 +24,9 @@ Deno.serve(async (req: Request) => {
   const jwt = await requireRole(req, SUPABASE_URL, SERVICE_KEY, undefined, origin)
 
   // Fetch the company_id from the logged-in HR user's profile
+  //ToDo: Check if special characters like & you need to encode it
+  //url injection attack, need to encode the component
+  //escape special for ULR
   const profileRes = await fetch(
     `${SUPABASE_URL}/rest/v1/profiles?user_id=eq.${jwt.sub}&select=company_id`,
     {

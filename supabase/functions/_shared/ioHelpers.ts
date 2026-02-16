@@ -15,7 +15,7 @@ export interface MultipartResult {
 }
 
 // Helper to handle CORS preflight OPTIONS requests
-export function corsResponse(origin?: string): Response {
+export function corsResponse(origin: string): Response {
   return new Response(null, {
     status: 204,
     headers: getCorsHeaders(origin),

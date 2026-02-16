@@ -1,7 +1,9 @@
 // supabase/functions/_shared/constants.ts
 
 // CORS headers for cross-origin requests
-export function getCorsHeaders(origin?: string): Record<string, string> {
+// prefedefined domanin whitelist which can access the API
+export function getCorsHeaders(origin: string): Record<string, string> {
+  //check the list for whitelisted domains
   return {
     "Access-Control-Allow-Origin": origin || "*",
     "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS",
