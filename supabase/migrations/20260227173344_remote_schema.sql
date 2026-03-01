@@ -1,4 +1,11 @@
+-- pgtap is kept installed for local testing; do not drop it.
+-- drop extension if exists "pgtap";
+
 drop view if exists "public"."profile_invites_with_details";
+
+alter table "public"."user_roles" add constraint "user_roles_user_id_profiles_fkey" FOREIGN KEY (user_id) REFERENCES public.profiles(user_id) ON UPDATE CASCADE ON DELETE CASCADE not valid;
+
+alter table "public"."user_roles" validate constraint "user_roles_user_id_profiles_fkey";
 
 create or replace view "public"."profile_invites_with_details" as  SELECT pi.id AS invite_id,
     pi.email,
@@ -6,8 +13,6 @@ create or replace view "public"."profile_invites_with_details" as  SELECT pi.id 
     pi.created_at AS invited_at,
     pi.company_id,
     c.name AS company_name,
-    c.monthly_benefit_subsidy,
-    c.contract_months,
     p.user_id,
     p.status AS profile_status,
     p.created_at AS registered_at,
@@ -17,37 +22,11 @@ create or replace view "public"."profile_invites_with_details" as  SELECT pi.id 
     COALESCE(p.department, pi.department) AS department,
     COALESCE(p.hire_date, pi.hire_date) AS hire_date,
     bb.id AS bike_benefit_id,
-    bb.step AS current_step,
     bb.benefit_status,
     bb.contract_status,
     COALESCE(bb.updated_at, bo.updated_at, p.created_at, pi.created_at) AS last_modified_at,
     bb.bike_id,
-    b.name AS bike_name,
-    b.brand AS bike_brand,
-    b.type AS bike_type,
-    b.full_price AS bike_full_price,
-        CASE
-            WHEN (b.full_price IS NOT NULL) THEN GREATEST((0)::numeric, (b.full_price - (c.monthly_benefit_subsidy * (c.contract_months)::numeric)))
-            ELSE NULL::numeric
-        END AS bike_employee_price,
-    c.monthly_benefit_subsidy AS monthly_benefit_price,
-    bb.committed_at,
-    bb.delivered_at,
-    bb.benefit_terminated_at,
-    bb.benefit_insurance_claim_at,
-    bb.contract_requested_at,
-    bb.contract_viewed_at,
-    bb.contract_employee_signed_at,
-    bb.contract_employer_signed_at,
-    bb.contract_approved_at,
-    bb.contract_terminated_at,
-    bb.live_test_location_coords,
-    bb.live_test_location_name,
-    bb.live_test_whatsapp_sent_at,
-    bb.live_test_checked_in_at,
-    bo.id AS order_id,
-    bo.helmet AS ordered_helmet,
-    bo.insurance AS ordered_insurance
+    bo.id AS order_id
    FROM (((((public.profile_invites pi
      LEFT JOIN public.companies c ON ((pi.company_id = c.id)))
      LEFT JOIN public.profiles p ON ((pi.email = p.email)))
@@ -56,16 +35,6 @@ create or replace view "public"."profile_invites_with_details" as  SELECT pi.id 
      LEFT JOIN public.bike_orders bo ON ((bb.id = bo.bike_benefit_id)))
   ORDER BY COALESCE(bb.updated_at, bo.updated_at, p.created_at, pi.created_at) DESC;
 
-
-drop trigger if exists "objects_delete_delete_prefix" on "storage"."objects";
-
-drop trigger if exists "objects_insert_create_prefix" on "storage"."objects";
-
-drop trigger if exists "objects_update_create_prefix" on "storage"."objects";
-
-drop trigger if exists "prefixes_create_hierarchy" on "storage"."prefixes";
-
-drop trigger if exists "prefixes_delete_hierarchy" on "storage"."prefixes";
 
 -- Supabase Cloud internal triggers — function does not exist in local CLI environment.
 -- CREATE TRIGGER protect_buckets_delete BEFORE DELETE ON storage.buckets FOR EACH STATEMENT EXECUTE FUNCTION storage.protect_delete();

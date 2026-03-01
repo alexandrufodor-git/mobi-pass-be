@@ -26,11 +26,74 @@ INSERT INTO public.companies (id, name, description, monthly_benefit_subsidy, co
 -- Profile Invites
 -- ============================================================================
 -- Add test invites so users can register via OTP
-INSERT INTO public.profile_invites (email, status, company_id) VALUES
-  ('test@example.com', 'inactive', '11111111-1111-1111-1111-111111111111'::uuid),
-  ('admin@example.com', 'inactive', '11111111-1111-1111-1111-111111111111'::uuid),
-  ('hr@example.com', 'inactive', '11111111-1111-1111-1111-111111111111'::uuid),
-  ('someonestolemyyahoo@gmail.com', 'inactive', '22222222-2222-2222-2222-222222222222'::uuid);
+INSERT INTO public.profile_invites (email, status, company_id, first_name, last_name) VALUES
+  ('test@example.com', 'inactive', '11111111-1111-1111-1111-111111111111'::uuid, 'Test', 'User'),
+  ('admin@example.com', 'inactive', '11111111-1111-1111-1111-111111111111'::uuid, 'Admin', 'User'),
+  ('hr@example.com', 'inactive', '11111111-1111-1111-1111-111111111111'::uuid, 'HR', 'User'),
+  ('someonestolemyyahoo@gmail.com', 'inactive', '22222222-2222-2222-2222-222222222222'::uuid, 'Someone', 'Else');
+
+-- ============================================================================
+-- Pre-registered users (auth.users + profiles + roles + bike_benefit)
+-- ============================================================================
+-- These bypass the OTP flow so local dev is immediately usable after db reset.
+
+-- Auth users
+-- encrypted_password = NULL prevents handle_user_registration trigger from firing
+-- (trigger condition: email_confirmed_at IS NOT NULL AND encrypted_password IS NOT NULL)
+-- so we can insert profiles/user_roles/bike_benefits manually below.
+INSERT INTO auth.users (
+  id, instance_id, aud, role, email, encrypted_password,
+  email_confirmed_at, created_at, updated_at,
+  confirmation_token, email_change, email_change_token_new, recovery_token,
+  raw_user_meta_data, raw_app_meta_data
+) VALUES
+  (
+    'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa'::uuid,
+    '00000000-0000-0000-0000-000000000000'::uuid,
+    'authenticated', 'authenticated',
+    'employee@example.com', NULL,
+    now(), now(), now(),
+    '', '', '', '',
+    '{}', '{"provider":"email","providers":["email"]}'
+  ),
+  (
+    'bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb'::uuid,
+    '00000000-0000-0000-0000-000000000000'::uuid,
+    'authenticated', 'authenticated',
+    'hr@example.com', NULL,
+    now(), now(), now(),
+    '', '', '', '',
+    '{}', '{"provider":"email","providers":["email"]}'
+  );
+
+-- Mark invites as active for these users
+UPDATE public.profile_invites
+SET status = 'active'
+WHERE email IN ('test@example.com', 'hr@example.com');
+
+-- Profiles
+INSERT INTO public.profiles (user_id, email, company_id, status, first_name, last_name, department) VALUES
+  (
+    'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa'::uuid,
+    'employee@example.com',
+    '11111111-1111-1111-1111-111111111111'::uuid,
+    'active', 'Alice', 'Employee', 'Engineering'
+  ),
+  (
+    'bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb'::uuid,
+    'hr@example.com',
+    '11111111-1111-1111-1111-111111111111'::uuid,
+    'active', 'Bob', 'HR', 'Human Resources'
+  );
+
+-- Roles
+INSERT INTO public.user_roles (user_id, role) VALUES
+  ('aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa'::uuid, 'employee'),
+  ('bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb'::uuid, 'hr');
+
+-- Bike benefit for the employee (trigger sets benefit_status = inactive)
+INSERT INTO public.bike_benefits (user_id)
+VALUES ('aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa'::uuid);
 
 -- ============================================================================
 -- Notes for Testing

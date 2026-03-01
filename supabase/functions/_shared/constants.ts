@@ -1,15 +1,37 @@
 // supabase/functions/_shared/constants.ts
 
-// CORS headers for cross-origin requests
-// prefedefined domanin whitelist which can access the API
-export function getCorsHeaders(origin: string): Record<string, string> {
-  //check the list for whitelisted domains
+// Allowed origins loaded once from the ALLOWED_ORIGINS env var (comma-separated).
+// Set this in supabase/config.toml [functions.*.env] or the Supabase dashboard.
+// Example: "https://app.example.com,https://admin.example.com"
+const ALLOWED_ORIGINS = new Set(
+  (Deno.env.get("ALLOWED_ORIGINS") ?? "")
+    .split(",")
+    .map((s) => s.trim())
+    .filter(Boolean)
+)
+
+// Returns CORS headers. Only reflects the request origin if it is in the
+// ALLOWED_ORIGINS allowlist — never falls back to "*".
+export function getCorsHeaders(origin?: string): Record<string, string> {
+  const allowedOrigin = (origin && ALLOWED_ORIGINS.has(origin)) ? origin : ""
   return {
-    "Access-Control-Allow-Origin": origin || "*",
+    "Access-Control-Allow-Origin": allowedOrigin,
     "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS",
     "Access-Control-Allow-Headers": "authorization, x-client-info, apikey, content-type",
   }
 }
+
+// eSignatures.com integration
+export const ESIGNATURES_API_URL  = "https://esignatures.com/api/contracts"
+export const ESIGNATURES_VAULT_KEY = "esignature_api_key"
+
+export const EsigEvents = {
+  VIEWED:          "signer-viewed-the-contract",
+  SIGNED:          "signer-signed",
+  DECLINED:        "signer-declined",
+  WITHDRAWN:       "contract-withdrawn",
+  CONTRACT_SIGNED: "contract-signed",
+} as const
 
 export const UserRoles = {
   ADMIN: "admin",
@@ -41,6 +63,14 @@ export const Errors = {
   PROFILE_FETCH_FAILED: { error: "profile_fetch_failed" },
   PROFILE_NOT_FOUND: { error: "profile_not_found" },
   NO_COMPANY: { error: "no_company_assigned" },
+  NO_HR: { error: "no_hr_assigned" },
+  // eSignatures / contract errors
+  NO_BIKE_BENEFIT: { error: "no_bike_benefit" },
+  NO_BIKE_SELECTED: { error: "no_bike_selected" },
+  BIKE_NOT_FOUND: { error: "bike_not_found" },
+  NO_TEMPLATE: { error: "no_esignatures_template" },
+  CONTRACT_ALREADY_REQUESTED: { error: "contract_already_requested" },
+  ESIGNATURES_API_FAILED: { error: "esignatures_api_failed" },
 } as const
 
 export function forbidden(error = Errors.FORBIDDEN, origin?: string): Response {

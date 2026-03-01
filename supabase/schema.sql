@@ -1,0 +1,1924 @@
+
+
+
+SET statement_timeout = 0;
+SET lock_timeout = 0;
+SET idle_in_transaction_session_timeout = 0;
+SET client_encoding = 'UTF8';
+SET standard_conforming_strings = on;
+SELECT pg_catalog.set_config('search_path', '', false);
+SET check_function_bodies = false;
+SET xmloption = content;
+SET client_min_messages = warning;
+SET row_security = off;
+
+
+CREATE EXTENSION IF NOT EXISTS "pg_net" WITH SCHEMA "extensions";
+
+
+
+
+
+
+COMMENT ON SCHEMA "public" IS 'standard public schema';
+
+
+
+CREATE EXTENSION IF NOT EXISTS "pg_graphql" WITH SCHEMA "graphql";
+
+
+
+
+
+
+CREATE EXTENSION IF NOT EXISTS "pg_stat_statements" WITH SCHEMA "extensions";
+
+
+
+
+
+
+CREATE EXTENSION IF NOT EXISTS "pgcrypto" WITH SCHEMA "extensions";
+
+
+
+
+
+
+CREATE EXTENSION IF NOT EXISTS "supabase_vault" WITH SCHEMA "vault";
+
+
+
+
+
+
+CREATE EXTENSION IF NOT EXISTS "uuid-ossp" WITH SCHEMA "extensions";
+
+
+
+
+
+
+CREATE TYPE "public"."benefit_status" AS ENUM (
+    'inactive',
+    'searching',
+    'testing',
+    'active',
+    'insurance_claim',
+    'terminated'
+);
+
+
+ALTER TYPE "public"."benefit_status" OWNER TO "postgres";
+
+
+COMMENT ON TYPE "public"."benefit_status" IS 'Benefit status for HR dashboard view. Auto-updated by triggers based on step and timestamps. NULL when step is NULL (benefit not yet started).';
+
+
+
+CREATE TYPE "public"."bike_benefit_step" AS ENUM (
+    'choose_bike',
+    'book_live_test',
+    'commit_to_bike',
+    'sign_contract',
+    'pickup_delivery'
+);
+
+
+ALTER TYPE "public"."bike_benefit_step" OWNER TO "postgres";
+
+
+COMMENT ON TYPE "public"."bike_benefit_step" IS 'Steps in the bike benefit workflow process';
+
+
+
+CREATE TYPE "public"."bike_type" AS ENUM (
+    'e_mtb_hardtail_29',
+    'e_mtb_hardtail_27_5',
+    'e_full_suspension_29',
+    'e_full_suspension_27_5',
+    'e_city_bike',
+    'e_touring',
+    'e_road_race',
+    'e_cargo_bike',
+    'e_kids_24'
+);
+
+
+ALTER TYPE "public"."bike_type" OWNER TO "postgres";
+
+
+COMMENT ON TYPE "public"."bike_type" IS 'Types of electric bikes available in the system';
+
+
+
+CREATE TYPE "public"."company_name" AS ENUM (
+    '8x8',
+    'BigTech1',
+    'SmallTech2'
+);
+
+
+ALTER TYPE "public"."company_name" OWNER TO "postgres";
+
+
+CREATE TYPE "public"."contract_status" AS ENUM (
+    'pending',
+    'viewed_by_employee',
+    'signed_by_employee',
+    'signed_by_employer',
+    'approved',
+    'terminated',
+    'declined_by_employee'
+);
+
+
+ALTER TYPE "public"."contract_status" OWNER TO "postgres";
+
+
+COMMENT ON TYPE "public"."contract_status" IS 'Contract signing workflow status. terminated is set manually by HR. declined_by_employee is set via eSignatures webhook.';
+
+
+
+CREATE TYPE "public"."currency_type" AS ENUM (
+    'EUR',
+    'RON'
+);
+
+
+ALTER TYPE "public"."currency_type" OWNER TO "postgres";
+
+
+COMMENT ON TYPE "public"."currency_type" IS 'Supported currencies. EUR: symbol €  |  RON: symbol RON';
+
+
+
+CREATE TYPE "public"."user_profile_status" AS ENUM (
+    'active',
+    'inactive'
+);
+
+
+ALTER TYPE "public"."user_profile_status" OWNER TO "postgres";
+
+
+CREATE TYPE "public"."user_role" AS ENUM (
+    'admin',
+    'hr',
+    'employee'
+);
+
+
+ALTER TYPE "public"."user_role" OWNER TO "postgres";
+
+
+COMMENT ON TYPE "public"."user_role" IS 'Type description for user role';
+
+
+
+CREATE TYPE "public"."user_role_permissions" AS ENUM (
+    'users.create'
+);
+
+
+ALTER TYPE "public"."user_role_permissions" OWNER TO "postgres";
+
+
+CREATE OR REPLACE FUNCTION "public"."auth_company_id"() RETURNS "uuid"
+    LANGUAGE "sql" STABLE SECURITY DEFINER
+    SET "search_path" TO 'public'
+    AS $$
+  SELECT company_id
+  FROM public.profiles
+  WHERE user_id = auth.uid()
+$$;
+
+
+ALTER FUNCTION "public"."auth_company_id"() OWNER TO "postgres";
+
+
+CREATE OR REPLACE FUNCTION "public"."authorize"("requested_permission" "public"."user_role_permissions") RETURNS boolean
+    LANGUAGE "plpgsql" STABLE SECURITY DEFINER
+    SET "search_path" TO ''
+    AS $$
+DECLARE
+  bind_permissions int;
+  user_role text;
+BEGIN
+  -- Fetch user role from JWT claims (injected by custom_access_token_hook)
+  user_role := auth.jwt() ->> 'user_role';
+  
+  -- Check if the role has the requested permission
+  SELECT count(*)
+  INTO bind_permissions
+  FROM public.role_permissions
+  WHERE role_permissions.permission = requested_permission
+    AND role_permissions.role::text = user_role;
+  
+  RETURN bind_permissions > 0;
+END;
+$$;
+
+
+ALTER FUNCTION "public"."authorize"("requested_permission" "public"."user_role_permissions") OWNER TO "postgres";
+
+
+COMMENT ON FUNCTION "public"."authorize"("requested_permission" "public"."user_role_permissions") IS 'Checks if the current user has the requested permission based on their role. Use in RLS policies: authorize(''users.create'')';
+
+
+
+CREATE OR REPLACE FUNCTION "public"."calc_employee_prices"("p_full_price" numeric, "p_monthly_subsidy" numeric, "p_contract_months" integer) RETURNS TABLE("employee_price" numeric, "monthly_employee_price" numeric)
+    LANGUAGE "sql" IMMUTABLE
+    AS $$
+  SELECT
+    CASE
+      WHEN p_full_price IS NOT NULL
+           AND p_monthly_subsidy IS NOT NULL
+           AND p_contract_months IS NOT NULL THEN
+        GREATEST(0::numeric,
+                 p_full_price - (p_monthly_subsidy * p_contract_months::numeric))
+      ELSE NULL::numeric
+    END                                                        AS employee_price,
+    CASE
+      WHEN p_full_price IS NOT NULL
+           AND p_monthly_subsidy IS NOT NULL
+           AND p_contract_months IS NOT NULL
+           AND p_contract_months > 0 THEN
+        GREATEST(0::numeric,
+                 p_full_price - (p_monthly_subsidy * p_contract_months::numeric))
+        / p_contract_months::numeric
+      ELSE NULL::numeric
+    END                                                        AS monthly_employee_price;
+$$;
+
+
+ALTER FUNCTION "public"."calc_employee_prices"("p_full_price" numeric, "p_monthly_subsidy" numeric, "p_contract_months" integer) OWNER TO "postgres";
+
+
+CREATE OR REPLACE FUNCTION "public"."calculate_employee_bike_price"("p_full_price" numeric, "p_company_id" "uuid") RETURNS numeric
+    LANGUAGE "plpgsql" STABLE
+    AS $$
+DECLARE
+  v_monthly_subsidy DECIMAL;
+  v_contract_months INTEGER;
+  v_total_subsidy DECIMAL;
+  v_employee_price DECIMAL;
+BEGIN
+  -- Get company benefit details
+  SELECT monthly_benefit_subsidy, contract_months
+  INTO v_monthly_subsidy, v_contract_months
+  FROM public.companies
+  WHERE id = p_company_id;
+  
+  -- Calculate total subsidy over contract period
+  v_total_subsidy := v_monthly_subsidy * v_contract_months;
+  
+  -- Calculate employee price (full price minus company subsidy)
+  v_employee_price := p_full_price - v_total_subsidy;
+  
+  -- Ensure price doesn't go below 0
+  IF v_employee_price < 0 THEN
+    v_employee_price := 0;
+  END IF;
+  
+  RETURN v_employee_price;
+END;
+$$;
+
+
+ALTER FUNCTION "public"."calculate_employee_bike_price"("p_full_price" numeric, "p_company_id" "uuid") OWNER TO "postgres";
+
+
+COMMENT ON FUNCTION "public"."calculate_employee_bike_price"("p_full_price" numeric, "p_company_id" "uuid") IS 'Calculates the employee price for a bike based on company subsidy. Formula: full_price - (monthly_subsidy * contract_months)';
+
+
+
+CREATE OR REPLACE FUNCTION "public"."custom_access_token_hook"("event" "jsonb") RETURNS "jsonb"
+    LANGUAGE "plpgsql" STABLE SECURITY DEFINER
+    SET "search_path" TO 'public'
+    AS $$
+DECLARE
+  claims jsonb;
+  user_role public.user_role;
+BEGIN
+  -- Get existing claims
+  claims := event->'claims';
+  
+  -- Fetch user role from user_roles table
+  SELECT role INTO user_role 
+  FROM public.user_roles 
+  WHERE user_id = (event->>'user_id')::uuid;
+  
+  -- Add user_role to JWT claims
+  IF user_role IS NOT NULL THEN
+    claims := jsonb_set(claims, '{user_role}', to_jsonb(user_role));
+  ELSE
+    -- No role assigned, set to null
+    claims := jsonb_set(claims, '{user_role}', 'null');
+  END IF;
+  
+  -- Update claims in the event
+  event := jsonb_set(event, '{claims}', claims);
+  
+  RETURN event;
+END;
+$$;
+
+
+ALTER FUNCTION "public"."custom_access_token_hook"("event" "jsonb") OWNER TO "postgres";
+
+
+COMMENT ON FUNCTION "public"."custom_access_token_hook"("event" "jsonb") IS 'Auth hook that injects user_role (admin/hr/employee) into JWT claims.
+No device validation - security enforced via:
+1. RLS policies based on user_role
+2. Client-side app logic to show/hide features by role';
+
+
+
+CREATE OR REPLACE FUNCTION "public"."get_company_terms_for_user"("p_user_id" "uuid") RETURNS TABLE("monthly_benefit_subsidy" numeric, "contract_months" integer, "currency" "public"."currency_type")
+    LANGUAGE "sql" STABLE
+    AS $$
+  SELECT c.monthly_benefit_subsidy,
+         c.contract_months,
+         c.currency
+  FROM   public.profiles pr
+  JOIN   public.companies c ON c.id = pr.company_id
+  WHERE  pr.user_id = p_user_id;
+$$;
+
+
+ALTER FUNCTION "public"."get_company_terms_for_user"("p_user_id" "uuid") OWNER TO "postgres";
+
+
+CREATE OR REPLACE FUNCTION "public"."get_my_company_user_ids"() RETURNS SETOF "uuid"
+    LANGUAGE "sql" STABLE SECURITY DEFINER
+    SET "search_path" TO 'public'
+    AS $$
+  SELECT p.user_id
+  FROM public.profiles p
+  WHERE p.company_id = (
+    SELECT company_id
+    FROM public.profiles
+    WHERE user_id = auth.uid()
+  )
+$$;
+
+
+ALTER FUNCTION "public"."get_my_company_user_ids"() OWNER TO "postgres";
+
+
+CREATE OR REPLACE FUNCTION "public"."get_my_role"() RETURNS "text"
+    LANGUAGE "sql" STABLE SECURITY DEFINER
+    AS $$
+  SELECT COALESCE(auth.jwt() ->> 'user_role', 'null');
+$$;
+
+
+ALTER FUNCTION "public"."get_my_role"() OWNER TO "postgres";
+
+
+COMMENT ON FUNCTION "public"."get_my_role"() IS 'Returns the current user''s role from JWT claims. Returns ''null'' if no role assigned.';
+
+
+
+CREATE OR REPLACE FUNCTION "public"."get_vault_secret"("secret_name" "text") RETURNS "text"
+    LANGUAGE "plpgsql" SECURITY DEFINER
+    SET "search_path" TO 'public', 'vault'
+    AS $$
+DECLARE
+  v_secret text;
+BEGIN
+  SELECT decrypted_secret
+  INTO   v_secret
+  FROM   vault.decrypted_secrets
+  WHERE  name = secret_name
+  LIMIT  1;
+
+  RETURN v_secret;
+END;
+$$;
+
+
+ALTER FUNCTION "public"."get_vault_secret"("secret_name" "text") OWNER TO "postgres";
+
+
+COMMENT ON FUNCTION "public"."get_vault_secret"("secret_name" "text") IS 'SECURITY DEFINER wrapper that lets edge functions read a named Vault secret via the REST API (POST /rpc/get_vault_secret). Returns NULL if the secret does not exist.';
+
+
+
+CREATE OR REPLACE FUNCTION "public"."handle_user_registration"() RETURNS "trigger"
+    LANGUAGE "plpgsql" SECURITY DEFINER
+    AS $$
+DECLARE
+  v_company_id uuid;
+  v_first_name text;
+  v_last_name text;
+  v_description text;
+  v_department text;
+  v_hire_date bigint;
+BEGIN
+  -- Only proceed if user has confirmed their email (via OTP verification)
+  IF NEW.email_confirmed_at IS NOT NULL THEN
+
+    -- 1. Resolve company_id and employee fields from profile_invites
+    SELECT 
+      pi.company_id,
+      pi.first_name,
+      pi.last_name,
+      pi.description,
+      pi.department,
+      pi.hire_date
+    INTO 
+      v_company_id,
+      v_first_name,
+      v_last_name,
+      v_description,
+      v_department,
+      v_hire_date
+    FROM public.profile_invites pi
+    WHERE LOWER(pi.email) = LOWER(NEW.email)
+    LIMIT 1;
+
+    -- Optional but STRONGLY recommended safety check
+    IF v_company_id IS NULL THEN
+      RAISE EXCEPTION
+        'No active invite found for email %',
+        NEW.email;
+      -- or: RETURN NEW;  -- if you want silent failure
+    END IF;
+    
+    -- 2. Automatically assign 'employee' role to new users
+    INSERT INTO public.user_roles (user_id, role)
+    VALUES (NEW.id, 'employee'::public.user_role)
+    ON CONFLICT (user_id, role) DO NOTHING;
+    
+    -- 3. Create or update profile with employee fields
+    INSERT INTO public.profiles (
+      user_id, 
+      email, 
+      status, 
+      company_id,
+      first_name,
+      last_name,
+      description,
+      department,
+      hire_date
+    )
+    VALUES (
+      NEW.id, 
+      NEW.email, 
+      'active'::public.user_profile_status, 
+      v_company_id,
+      v_first_name,
+      v_last_name,
+      v_description,
+      v_department,
+      v_hire_date
+    )
+    ON CONFLICT (user_id) 
+    DO UPDATE SET 
+      email = EXCLUDED.email,
+      status = 'active'::public.user_profile_status,
+      company_id = EXCLUDED.company_id,
+      first_name = EXCLUDED.first_name,
+      last_name = EXCLUDED.last_name,
+      description = EXCLUDED.description,
+      department = EXCLUDED.department,
+      hire_date = EXCLUDED.hire_date;
+    
+    -- 4. Update profile_invites status to 'active'
+    UPDATE public.profile_invites
+    SET status = 'active'::public.user_profile_status
+    WHERE LOWER(email) = LOWER(NEW.email);
+    
+    -- 5. Create a bike benefit for the user
+    INSERT INTO public.bike_benefits (user_id)
+    VALUES (NEW.id)
+    ON CONFLICT DO NOTHING;
+    
+  END IF;
+  
+  RETURN NEW;
+END;
+$$;
+
+
+ALTER FUNCTION "public"."handle_user_registration"() OWNER TO "postgres";
+
+
+CREATE OR REPLACE FUNCTION "public"."sync_profile_email"() RETURNS "trigger"
+    LANGUAGE "plpgsql"
+    AS $$
+BEGIN
+  -- if email changed, update profile.email
+  IF NEW.email IS DISTINCT FROM OLD.email THEN
+    UPDATE public.profiles SET email = NEW.email WHERE user_id = NEW.id;
+  END IF;
+  RETURN NEW;
+END;
+$$;
+
+
+ALTER FUNCTION "public"."sync_profile_email"() OWNER TO "postgres";
+
+
+CREATE OR REPLACE FUNCTION "public"."update_bike_benefit_status"() RETURNS "trigger"
+    LANGUAGE "plpgsql" SECURITY DEFINER
+    SET "search_path" TO 'public'
+    AS $$
+BEGIN
+  -- HR terminal states: never overwrite automatically
+  IF TG_OP = 'UPDATE'
+     AND OLD.benefit_status IN (
+       'insurance_claim'::public.benefit_status,
+       'terminated'::public.benefit_status
+     ) THEN
+    RETURN NEW;
+  END IF;
+
+  -- Snap currency + contract_months only on new benefit creation
+  IF TG_OP = 'INSERT' THEN
+    SELECT t.currency, t.contract_months
+    INTO   NEW.employee_currency, NEW.employee_contract_months
+    FROM   public.get_company_terms_for_user(NEW.user_id) t;
+  END IF;
+
+  IF NEW.step IS NULL THEN
+    NEW.benefit_status := 'inactive'::public.benefit_status;
+
+  ELSIF NEW.step = 'choose_bike'::public.bike_benefit_step THEN
+    IF TG_OP = 'UPDATE'
+       AND (OLD.step IS NULL OR OLD.step <> 'choose_bike'::public.bike_benefit_step) THEN
+      NEW.live_test_whatsapp_sent_at  := NULL;
+      NEW.live_test_checked_in_at     := NULL;
+      NEW.committed_at                := NULL;
+      NEW.contract_requested_at       := NULL;
+      NEW.contract_viewed_at          := NULL;
+      NEW.contract_employee_signed_at := NULL;
+      NEW.contract_employer_signed_at := NULL;
+      NEW.contract_approved_at        := NULL;
+      NEW.contract_declined_at        := NULL;
+      NEW.delivered_at                := NULL;
+      NEW.contract_status             := NULL;
+      NEW.employee_full_price         := NULL;
+      NEW.employee_monthly_price      := NULL;
+      NEW.employee_contract_months    := NULL;
+      DELETE FROM public.bike_orders WHERE bike_benefit_id = NEW.id;
+      DELETE FROM public.contracts WHERE bike_benefit_id = NEW.id;
+    END IF;
+    NEW.benefit_status := 'searching'::public.benefit_status;
+
+  ELSIF NEW.step = 'book_live_test'::public.bike_benefit_step THEN
+    NEW.benefit_status := 'searching'::public.benefit_status;
+
+  ELSIF NEW.step = 'commit_to_bike'::public.bike_benefit_step THEN
+    IF NEW.bike_id IS NOT NULL THEN
+      SELECT p.employee_price, p.monthly_employee_price, t.contract_months
+      INTO   NEW.employee_full_price, NEW.employee_monthly_price, NEW.employee_contract_months
+      FROM         public.bikes b
+      JOIN         public.get_company_terms_for_user(NEW.user_id) t ON true
+      CROSS JOIN LATERAL public.calc_employee_prices(
+                   b.full_price, t.monthly_benefit_subsidy, t.contract_months
+                 ) p
+      WHERE  b.id = NEW.bike_id;
+    END IF;
+
+    IF NEW.live_test_whatsapp_sent_at IS NOT NULL THEN
+      NEW.benefit_status := 'testing'::public.benefit_status;
+    ELSE
+      NEW.benefit_status := 'searching'::public.benefit_status;
+    END IF;
+
+  ELSIF NEW.step = 'sign_contract'::public.bike_benefit_step THEN
+    IF NEW.committed_at IS NOT NULL THEN
+      NEW.benefit_status := 'active'::public.benefit_status;
+    ELSE
+      NEW.benefit_status := COALESCE(OLD.benefit_status, 'searching'::public.benefit_status);
+    END IF;
+
+  ELSIF NEW.step = 'pickup_delivery'::public.bike_benefit_step THEN
+    NEW.benefit_status := COALESCE(OLD.benefit_status, 'active'::public.benefit_status);
+
+  END IF;
+
+  RETURN NEW;
+END;
+$$;
+
+
+ALTER FUNCTION "public"."update_bike_benefit_status"() OWNER TO "postgres";
+
+
+COMMENT ON FUNCTION "public"."update_bike_benefit_status"() IS 'Auto-updates benefit_status on step / timestamp changes.
+Terminal-state guard: once HR sets insurance_claim or terminated, any
+subsequent step/timestamp updates are ignored until HR explicitly changes it.
+choose_bike resets all downstream timestamps, contract_status, pricing,
+and deletes related bike_orders and contracts rows.';
+
+
+
+CREATE OR REPLACE FUNCTION "public"."update_contract_status"() RETURNS "trigger"
+    LANGUAGE "plpgsql"
+    AS $$
+BEGIN
+  -- Terminal guard: only terminated is permanent (manual HR action).
+  -- declined_by_employee is NOT guarded — a new contract can be re-sent.
+  IF TG_OP = 'UPDATE'
+     AND OLD.contract_status = 'terminated'::public.contract_status THEN
+    RETURN NEW;
+  END IF;
+
+  -- Priority chain (highest → lowest)
+  IF NEW.contract_declined_at IS NOT NULL THEN
+    NEW.contract_status := 'declined_by_employee'::public.contract_status;
+  ELSIF NEW.contract_employee_signed_at IS NOT NULL
+     AND NEW.contract_employer_signed_at IS NOT NULL
+     AND NEW.contract_approved_at        IS NOT NULL THEN
+    NEW.contract_status := 'approved'::public.contract_status;
+  ELSIF NEW.contract_employer_signed_at IS NOT NULL THEN
+    NEW.contract_status := 'signed_by_employer'::public.contract_status;
+  ELSIF NEW.contract_employee_signed_at IS NOT NULL THEN
+    NEW.contract_status := 'signed_by_employee'::public.contract_status;
+  ELSIF NEW.contract_viewed_at IS NOT NULL THEN
+    NEW.contract_status := 'viewed_by_employee'::public.contract_status;
+  ELSIF NEW.contract_requested_at IS NOT NULL THEN
+    NEW.contract_status := 'pending'::public.contract_status;
+  ELSE
+    NEW.contract_status := NULL;
+  END IF;
+
+  RETURN NEW;
+END;
+$$;
+
+
+ALTER FUNCTION "public"."update_contract_status"() OWNER TO "postgres";
+
+
+COMMENT ON FUNCTION "public"."update_contract_status"() IS 'Trigger function that auto-updates contract_status based on contract timestamp changes.
+Sets ''pending'' when contract_requested_at IS NOT NULL (contract requested but not yet viewed).
+Falls back to NULL when no contract timestamps are set.
+Does not override manually set terminated status.';
+
+
+
+CREATE OR REPLACE FUNCTION "public"."update_updated_at_column"() RETURNS "trigger"
+    LANGUAGE "plpgsql"
+    AS $$
+BEGIN
+  NEW.updated_at = now();
+  RETURN NEW;
+END;
+$$;
+
+
+ALTER FUNCTION "public"."update_updated_at_column"() OWNER TO "postgres";
+
+SET default_tablespace = '';
+
+SET default_table_access_method = "heap";
+
+
+CREATE TABLE IF NOT EXISTS "public"."bike_benefits" (
+    "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,
+    "user_id" "uuid" NOT NULL,
+    "bike_id" "uuid",
+    "live_test_location" "text",
+    "live_test_whatsapp_sent_at" timestamp with time zone,
+    "live_test_checked_in_at" timestamp with time zone,
+    "committed_at" timestamp with time zone,
+    "checked_in_at" timestamp with time zone,
+    "contract_requested_at" timestamp with time zone,
+    "delivered_at" timestamp with time zone,
+    "created_at" timestamp with time zone DEFAULT "now"() NOT NULL,
+    "updated_at" timestamp with time zone DEFAULT "now"() NOT NULL,
+    "live_test_location_coords" "text",
+    "live_test_location_name" "text",
+    "benefit_status" "public"."benefit_status",
+    "contract_status" "public"."contract_status",
+    "contract_viewed_at" timestamp with time zone,
+    "contract_employee_signed_at" timestamp with time zone,
+    "contract_employer_signed_at" timestamp with time zone,
+    "contract_approved_at" timestamp with time zone,
+    "contract_terminated_at" timestamp with time zone,
+    "benefit_terminated_at" timestamp with time zone,
+    "benefit_insurance_claim_at" timestamp with time zone,
+    "step" "public"."bike_benefit_step",
+    "employee_currency" "public"."currency_type",
+    "employee_full_price" numeric(10,2),
+    "employee_monthly_price" numeric(10,2),
+    "employee_contract_months" integer,
+    "contract_declined_at" timestamp with time zone
+);
+
+
+ALTER TABLE "public"."bike_benefits" OWNER TO "postgres";
+
+
+COMMENT ON COLUMN "public"."bike_benefits"."live_test_location_coords" IS 'Location coordinates in "lon,lat" format (e.g., "23.5880556,46.7712101")';
+
+
+
+COMMENT ON COLUMN "public"."bike_benefits"."live_test_location_name" IS 'Human-readable name of the test location (e.g., "Maros Bike Cluj")';
+
+
+
+COMMENT ON COLUMN "public"."bike_benefits"."benefit_status" IS 'Overall benefit status for HR view. Auto-updated by triggers. NULL when employee has not started the benefit process yet.';
+
+
+
+COMMENT ON COLUMN "public"."bike_benefits"."contract_status" IS 'Contract signing workflow status. Updated manually or via triggers.';
+
+
+
+COMMENT ON COLUMN "public"."bike_benefits"."contract_viewed_at" IS 'Timestamp when employee first viewed the contract';
+
+
+
+COMMENT ON COLUMN "public"."bike_benefits"."contract_employee_signed_at" IS 'Timestamp when employee signed the contract';
+
+
+
+COMMENT ON COLUMN "public"."bike_benefits"."contract_employer_signed_at" IS 'Timestamp when employer signed the contract';
+
+
+
+COMMENT ON COLUMN "public"."bike_benefits"."contract_approved_at" IS 'Timestamp when contract was fully approved (both parties signed)';
+
+
+
+COMMENT ON COLUMN "public"."bike_benefits"."contract_terminated_at" IS 'Timestamp when contract was terminated';
+
+
+
+COMMENT ON COLUMN "public"."bike_benefits"."benefit_terminated_at" IS 'Timestamp when benefit was terminated';
+
+
+
+COMMENT ON COLUMN "public"."bike_benefits"."benefit_insurance_claim_at" IS 'Timestamp when insurance claim was filed';
+
+
+
+COMMENT ON COLUMN "public"."bike_benefits"."step" IS 'Current step in the bike benefit workflow. NULL when benefit not yet started.';
+
+
+
+COMMENT ON COLUMN "public"."bike_benefits"."employee_currency" IS 'Currency locked for this employee at benefit creation. NULL for legacy records — falls back to companies.currency in views.';
+
+
+
+COMMENT ON COLUMN "public"."bike_benefits"."employee_full_price" IS 'Total discounted price: GREATEST(0, full_price - (monthly_subsidy x contract_months)). Computed and stored when step transitions to commit_to_bike. Cleared on choose_bike reset.';
+
+
+
+COMMENT ON COLUMN "public"."bike_benefits"."employee_monthly_price" IS 'Monthly employee payment: employee_full_price / contract_months. Computed and stored when step transitions to commit_to_bike. Cleared on choose_bike reset.';
+
+
+
+COMMENT ON COLUMN "public"."bike_benefits"."employee_contract_months" IS 'Contract duration (months) locked for this employee at benefit creation. Re-confirmed and stored when step transitions to commit_to_bike. Cleared on choose_bike reset. NULL for legacy records.';
+
+
+
+COMMENT ON COLUMN "public"."bike_benefits"."contract_declined_at" IS 'Set by webhook when the employee declines the contract (signer-declined event). Drives contract_status → declined_by_employee via trigger.';
+
+
+
+CREATE TABLE IF NOT EXISTS "public"."bike_orders" (
+    "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,
+    "user_id" "uuid" NOT NULL,
+    "bike_benefit_id" "uuid" NOT NULL,
+    "helmet" boolean DEFAULT false NOT NULL,
+    "insurance" boolean DEFAULT false NOT NULL,
+    "created_at" timestamp with time zone DEFAULT "now"() NOT NULL,
+    "updated_at" timestamp with time zone DEFAULT "now"() NOT NULL
+);
+
+
+ALTER TABLE "public"."bike_orders" OWNER TO "postgres";
+
+
+CREATE TABLE IF NOT EXISTS "public"."bikes" (
+    "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,
+    "name" "text" NOT NULL,
+    "created_at" timestamp with time zone DEFAULT "now"() NOT NULL,
+    "updated_at" timestamp with time zone DEFAULT "now"() NOT NULL,
+    "brand" "text",
+    "description" "text",
+    "image_url" "text",
+    "full_price" numeric(10,2) DEFAULT 0 NOT NULL,
+    "employee_price" numeric(10,2),
+    "weight_kg" numeric(5,2),
+    "charge_time_hours" numeric(4,2),
+    "range_max_km" integer,
+    "power_wh" integer,
+    "engine" "text",
+    "supported_features" "text",
+    "frame_material" "text",
+    "frame_size" "text",
+    "wheel_size" "text",
+    "wheel_bandwidth" "text",
+    "lock_type" "text",
+    "sku" "text",
+    "dealer_name" "text" DEFAULT 'Maros Bike'::"text",
+    "dealer_address" "text" DEFAULT 'Cluj Napoca str. Aurel Vlaicu Nr. 25'::"text",
+    "dealer_location_coords" "text" DEFAULT '23.62565635434891,46.780762423563985'::"text",
+    "available_for_test" boolean DEFAULT true,
+    "in_stock" boolean DEFAULT true,
+    "type" "public"."bike_type",
+    "images" "jsonb"
+);
+
+
+ALTER TABLE "public"."bikes" OWNER TO "postgres";
+
+
+COMMENT ON COLUMN "public"."bikes"."dealer_location_coords" IS 'Dealer location in "lon,lat" format for test rides and pickup';
+
+
+
+COMMENT ON COLUMN "public"."bikes"."type" IS 'Type/category of the bike (e.g., e-MTB, e-city, e-touring)';
+
+
+
+CREATE TABLE IF NOT EXISTS "public"."companies" (
+    "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,
+    "created_at" timestamp with time zone DEFAULT "now"() NOT NULL,
+    "name" "public"."company_name" NOT NULL,
+    "description" "text",
+    "monthly_benefit_subsidy" numeric(10,2) DEFAULT 72.00,
+    "contract_months" integer DEFAULT 36,
+    "currency" "public"."currency_type" DEFAULT 'RON'::"public"."currency_type" NOT NULL,
+    "esignatures_template_id" "text"
+);
+
+
+ALTER TABLE "public"."companies" OWNER TO "postgres";
+
+
+COMMENT ON TABLE "public"."companies" IS 'This represents the companies for which each users adhere to. 1 user can have only 1 company a company can have multiple users.';
+
+
+
+COMMENT ON COLUMN "public"."companies"."monthly_benefit_subsidy" IS 'Monthly subsidy amount the company provides for bike benefits (e.g., €72/month)';
+
+
+
+COMMENT ON COLUMN "public"."companies"."contract_months" IS 'Standard contract duration in months for bike benefits (e.g., 36 months)';
+
+
+
+COMMENT ON COLUMN "public"."companies"."currency" IS 'Currency used for bike benefit pricing. Defaults to RON.';
+
+
+
+COMMENT ON COLUMN "public"."companies"."esignatures_template_id" IS 'eSignatures.com template ID used to generate bike benefit contracts for employees of this company. Must be set before send-contract can be called.';
+
+
+
+CREATE TABLE IF NOT EXISTS "public"."profiles" (
+    "user_id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,
+    "email" "text" NOT NULL,
+    "created_at" timestamp with time zone DEFAULT "now"() NOT NULL,
+    "status" "public"."user_profile_status" DEFAULT 'inactive'::"public"."user_profile_status" NOT NULL,
+    "company_id" "uuid" NOT NULL,
+    "first_name" "text" NOT NULL,
+    "last_name" "text" NOT NULL,
+    "description" "text",
+    "department" "text",
+    "hire_date" bigint
+);
+
+
+ALTER TABLE "public"."profiles" OWNER TO "postgres";
+
+
+COMMENT ON COLUMN "public"."profiles"."first_name" IS 'Employee first name';
+
+
+
+COMMENT ON COLUMN "public"."profiles"."last_name" IS 'Employee last name';
+
+
+
+COMMENT ON COLUMN "public"."profiles"."description" IS 'Employee description or bio';
+
+
+
+COMMENT ON COLUMN "public"."profiles"."department" IS 'Employee department or team';
+
+
+
+COMMENT ON COLUMN "public"."profiles"."hire_date" IS 'Employee hire date as Unix timestamp in milliseconds';
+
+
+
+CREATE OR REPLACE VIEW "public"."bikes_with_my_pricing" WITH ("security_invoker"='on') AS
+ SELECT "b"."id",
+    "b"."name",
+    "b"."created_at",
+    "b"."updated_at",
+    "b"."brand",
+    "b"."description",
+    "b"."image_url",
+    "b"."full_price",
+    "b"."employee_price",
+    "b"."weight_kg",
+    "b"."charge_time_hours",
+    "b"."range_max_km",
+    "b"."power_wh",
+    "b"."engine",
+    "b"."supported_features",
+    "b"."frame_material",
+    "b"."frame_size",
+    "b"."wheel_size",
+    "b"."wheel_bandwidth",
+    "b"."lock_type",
+    "b"."sku",
+    "b"."dealer_name",
+    "b"."dealer_address",
+    "b"."dealer_location_coords",
+    "b"."available_for_test",
+    "b"."in_stock",
+    "b"."type",
+    "b"."images",
+    "c"."monthly_benefit_subsidy",
+    "c"."contract_months",
+    "c"."contract_months" AS "employee_contract_month",
+    "c"."currency",
+    "prices"."employee_price" AS "employee_full_price",
+    "prices"."monthly_employee_price" AS "employee_monthly_price"
+   FROM ((("public"."bikes" "b"
+     LEFT JOIN "public"."profiles" "me" ON (("me"."user_id" = "auth"."uid"())))
+     LEFT JOIN "public"."companies" "c" ON (("c"."id" = "me"."company_id")))
+     LEFT JOIN LATERAL "public"."calc_employee_prices"("b"."full_price", "c"."monthly_benefit_subsidy", "c"."contract_months") "prices"("employee_price", "monthly_employee_price") ON (true));
+
+
+ALTER VIEW "public"."bikes_with_my_pricing" OWNER TO "postgres";
+
+
+COMMENT ON VIEW "public"."bikes_with_my_pricing" IS 'Bike catalog with employee-specific pricing. Uses auth.uid() to resolve the calling user''s company subsidy and contract terms automatically. Returns all bikes; pricing columns are NULL when the user has no linked company. employee_full_price    = GREATEST(0, full_price - (contract_months x monthly_benefit_subsidy)). employee_monthly_price = employee_full_price / contract_months. employee_contract_month = companies.contract_months for the calling user''s company.';
+
+
+
+CREATE TABLE IF NOT EXISTS "public"."contracts" (
+    "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,
+    "bike_benefit_id" "uuid" NOT NULL,
+    "user_id" "uuid" NOT NULL,
+    "esignatures_contract_id" "text" NOT NULL,
+    "esignatures_signer_id" "text",
+    "esignatures_template_id" "text" NOT NULL,
+    "sign_page_url" "text",
+    "api_response" "jsonb",
+    "last_webhook_payload" "jsonb",
+    "last_webhook_event" "text",
+    "created_at" timestamp with time zone DEFAULT "now"() NOT NULL,
+    "updated_at" timestamp with time zone DEFAULT "now"() NOT NULL
+);
+
+
+ALTER TABLE "public"."contracts" OWNER TO "postgres";
+
+
+COMMENT ON TABLE "public"."contracts" IS 'Tracks eSignatures.com contract lifecycle for each bike benefit. One row per contract request.';
+
+
+
+COMMENT ON COLUMN "public"."contracts"."esignatures_contract_id" IS 'Contract ID returned by eSignatures.com API';
+
+
+
+COMMENT ON COLUMN "public"."contracts"."esignatures_signer_id" IS 'Signer ID for the employee returned by eSignatures.com API';
+
+
+
+COMMENT ON COLUMN "public"."contracts"."esignatures_template_id" IS 'Template ID used to create this contract (snapshotted from company at request time)';
+
+
+
+COMMENT ON COLUMN "public"."contracts"."sign_page_url" IS 'URL the employee visits to sign the contract';
+
+
+
+COMMENT ON COLUMN "public"."contracts"."api_response" IS 'Full eSignatures.com API response (audit trail)';
+
+
+
+COMMENT ON COLUMN "public"."contracts"."last_webhook_payload" IS 'Latest webhook payload received from eSignatures.com (debug)';
+
+
+
+COMMENT ON COLUMN "public"."contracts"."last_webhook_event" IS 'Event string from the latest webhook (e.g. signer-signed)';
+
+
+
+CREATE TABLE IF NOT EXISTS "public"."profile_invites" (
+    "email" "text" NOT NULL,
+    "status" "public"."user_profile_status" DEFAULT 'inactive'::"public"."user_profile_status" NOT NULL,
+    "created_at" timestamp with time zone DEFAULT "now"() NOT NULL,
+    "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,
+    "company_id" "uuid" NOT NULL,
+    "user_id" "uuid",
+    "first_name" "text" NOT NULL,
+    "last_name" "text" NOT NULL,
+    "description" "text",
+    "department" "text",
+    "hire_date" bigint
+);
+
+
+ALTER TABLE "public"."profile_invites" OWNER TO "postgres";
+
+
+COMMENT ON COLUMN "public"."profile_invites"."user_id" IS 'Links to the user profile after they complete registration';
+
+
+
+COMMENT ON COLUMN "public"."profile_invites"."first_name" IS 'Employee first name';
+
+
+
+COMMENT ON COLUMN "public"."profile_invites"."last_name" IS 'Employee last name';
+
+
+
+COMMENT ON COLUMN "public"."profile_invites"."description" IS 'Employee description or bio';
+
+
+
+COMMENT ON COLUMN "public"."profile_invites"."department" IS 'Employee department or team';
+
+
+
+COMMENT ON COLUMN "public"."profile_invites"."hire_date" IS 'Employee hire date as Unix timestamp in milliseconds';
+
+
+
+CREATE OR REPLACE VIEW "public"."profile_invites_with_details" WITH ("security_invoker"='on') AS
+ SELECT "pi"."id" AS "invite_id",
+    "pi"."email",
+    "pi"."status" AS "invite_status",
+    "pi"."created_at" AS "invited_at",
+    "pi"."company_id",
+    "c"."name" AS "company_name",
+    "p"."user_id",
+    "p"."status" AS "profile_status",
+    "p"."created_at" AS "registered_at",
+    COALESCE("p"."first_name", "pi"."first_name") AS "first_name",
+    COALESCE("p"."last_name", "pi"."last_name") AS "last_name",
+    COALESCE("p"."description", "pi"."description") AS "description",
+    COALESCE("p"."department", "pi"."department") AS "department",
+    COALESCE("p"."hire_date", "pi"."hire_date") AS "hire_date",
+    "bb"."id" AS "bike_benefit_id",
+    "bb"."benefit_status",
+    "bb"."contract_status",
+    COALESCE("bb"."updated_at", "bo"."updated_at", "p"."created_at", "pi"."created_at") AS "last_modified_at",
+    "bb"."bike_id",
+    "bo"."id" AS "order_id"
+   FROM ((((("public"."profile_invites" "pi"
+     LEFT JOIN "public"."companies" "c" ON (("pi"."company_id" = "c"."id")))
+     LEFT JOIN "public"."profiles" "p" ON (("pi"."email" = "p"."email")))
+     LEFT JOIN "public"."bike_benefits" "bb" ON (("p"."user_id" = "bb"."user_id")))
+     LEFT JOIN "public"."bikes" "b" ON (("bb"."bike_id" = "b"."id")))
+     LEFT JOIN "public"."bike_orders" "bo" ON (("bb"."id" = "bo"."bike_benefit_id")))
+  ORDER BY COALESCE("bb"."updated_at", "bo"."updated_at", "p"."created_at", "pi"."created_at") DESC;
+
+
+ALTER VIEW "public"."profile_invites_with_details" OWNER TO "postgres";
+
+
+CREATE TABLE IF NOT EXISTS "public"."role_permissions" (
+    "id" bigint NOT NULL,
+    "role" "public"."user_role" NOT NULL,
+    "permission" "public"."user_role_permissions" NOT NULL
+);
+
+
+ALTER TABLE "public"."role_permissions" OWNER TO "postgres";
+
+
+COMMENT ON TABLE "public"."role_permissions" IS 'Permissions for each role. Use authorize() function in RLS policies to check permissions.';
+
+
+
+ALTER TABLE "public"."role_permissions" ALTER COLUMN "id" ADD GENERATED BY DEFAULT AS IDENTITY (
+    SEQUENCE NAME "public"."role_permissions_id_seq"
+    START WITH 1
+    INCREMENT BY 1
+    NO MINVALUE
+    NO MAXVALUE
+    CACHE 1
+);
+
+
+
+CREATE TABLE IF NOT EXISTS "public"."user_roles" (
+    "id" bigint NOT NULL,
+    "user_id" "uuid" DEFAULT "auth"."uid"() NOT NULL,
+    "role" "public"."user_role" NOT NULL
+);
+
+
+ALTER TABLE "public"."user_roles" OWNER TO "postgres";
+
+
+COMMENT ON TABLE "public"."user_roles" IS 'User roles for RBAC. Roles are injected into JWT via custom_access_token_hook.';
+
+
+
+ALTER TABLE "public"."user_roles" ALTER COLUMN "id" ADD GENERATED BY DEFAULT AS IDENTITY (
+    SEQUENCE NAME "public"."user_roles_id_seq"
+    START WITH 1
+    INCREMENT BY 1
+    NO MINVALUE
+    NO MAXVALUE
+    CACHE 1
+);
+
+
+
+ALTER TABLE ONLY "public"."bike_benefits"
+    ADD CONSTRAINT "bike_benefits_pkey" PRIMARY KEY ("id");
+
+
+
+ALTER TABLE ONLY "public"."bike_orders"
+    ADD CONSTRAINT "bike_orders_pkey" PRIMARY KEY ("id");
+
+
+
+ALTER TABLE ONLY "public"."bikes"
+    ADD CONSTRAINT "bikes_pkey" PRIMARY KEY ("id");
+
+
+
+ALTER TABLE ONLY "public"."companies"
+    ADD CONSTRAINT "companies_pkey" PRIMARY KEY ("id");
+
+
+
+ALTER TABLE ONLY "public"."contracts"
+    ADD CONSTRAINT "contracts_esignatures_contract_id_key" UNIQUE ("esignatures_contract_id");
+
+
+
+ALTER TABLE ONLY "public"."contracts"
+    ADD CONSTRAINT "contracts_pkey" PRIMARY KEY ("id");
+
+
+
+ALTER TABLE ONLY "public"."profile_invites"
+    ADD CONSTRAINT "profile_invites_email_key" UNIQUE ("email");
+
+
+
+ALTER TABLE ONLY "public"."profile_invites"
+    ADD CONSTRAINT "profile_invites_pkey" PRIMARY KEY ("id");
+
+
+
+ALTER TABLE ONLY "public"."profiles"
+    ADD CONSTRAINT "profiles_email_key" UNIQUE ("email");
+
+
+
+ALTER TABLE ONLY "public"."profiles"
+    ADD CONSTRAINT "profiles_pkey" PRIMARY KEY ("user_id");
+
+
+
+ALTER TABLE ONLY "public"."role_permissions"
+    ADD CONSTRAINT "role_permissions_permission_key" UNIQUE ("permission");
+
+
+
+ALTER TABLE ONLY "public"."role_permissions"
+    ADD CONSTRAINT "role_permissions_pkey" PRIMARY KEY ("id");
+
+
+
+ALTER TABLE ONLY "public"."role_permissions"
+    ADD CONSTRAINT "role_permissions_role_key" UNIQUE ("role");
+
+
+
+ALTER TABLE ONLY "public"."bike_orders"
+    ADD CONSTRAINT "unique_benefit_order" UNIQUE ("bike_benefit_id");
+
+
+
+ALTER TABLE ONLY "public"."user_roles"
+    ADD CONSTRAINT "user_roles_pkey" PRIMARY KEY ("id");
+
+
+
+CREATE INDEX "idx_bike_benefits_benefit_status" ON "public"."bike_benefits" USING "btree" ("benefit_status");
+
+
+
+CREATE INDEX "idx_bike_benefits_bike_id" ON "public"."bike_benefits" USING "btree" ("bike_id");
+
+
+
+CREATE INDEX "idx_bike_benefits_contract_status" ON "public"."bike_benefits" USING "btree" ("contract_status");
+
+
+
+CREATE INDEX "idx_bike_benefits_user_id" ON "public"."bike_benefits" USING "btree" ("user_id");
+
+
+
+CREATE INDEX "idx_bike_orders_bike_benefit_id" ON "public"."bike_orders" USING "btree" ("bike_benefit_id");
+
+
+
+CREATE INDEX "idx_bike_orders_user_id" ON "public"."bike_orders" USING "btree" ("user_id");
+
+
+
+CREATE INDEX "idx_bikes_name" ON "public"."bikes" USING "btree" ("name");
+
+
+
+CREATE INDEX "idx_bikes_type" ON "public"."bikes" USING "btree" ("type");
+
+
+
+CREATE INDEX "idx_contracts_bike_benefit_id" ON "public"."contracts" USING "btree" ("bike_benefit_id");
+
+
+
+CREATE INDEX "idx_contracts_esignatures_contract_id" ON "public"."contracts" USING "btree" ("esignatures_contract_id");
+
+
+
+CREATE INDEX "idx_contracts_user_id" ON "public"."contracts" USING "btree" ("user_id");
+
+
+
+CREATE INDEX "idx_profile_invites_company_id" ON "public"."profile_invites" USING "btree" ("company_id");
+
+
+
+CREATE INDEX "idx_profile_invites_user_id" ON "public"."profile_invites" USING "btree" ("user_id");
+
+
+
+CREATE INDEX "idx_profiles_company_id" ON "public"."profiles" USING "btree" ("company_id");
+
+
+
+CREATE INDEX "idx_profiles_department" ON "public"."profiles" USING "btree" ("department") WHERE ("department" IS NOT NULL);
+
+
+
+CREATE UNIQUE INDEX "idx_profiles_email_unique" ON "public"."profiles" USING "btree" ("lower"("email")) WHERE ("email" IS NOT NULL);
+
+
+
+CREATE INDEX "idx_profiles_hire_date" ON "public"."profiles" USING "btree" ("hire_date") WHERE ("hire_date" IS NOT NULL);
+
+
+
+CREATE INDEX "idx_profiles_last_name" ON "public"."profiles" USING "btree" ("last_name");
+
+
+
+CREATE UNIQUE INDEX "user_roles_user_role_idx" ON "public"."user_roles" USING "btree" ("user_id", "role");
+
+
+
+CREATE OR REPLACE TRIGGER "set_contracts_updated_at" BEFORE UPDATE ON "public"."contracts" FOR EACH ROW EXECUTE FUNCTION "public"."update_updated_at_column"();
+
+
+
+CREATE OR REPLACE TRIGGER "update_benefit_status_on_change" BEFORE INSERT OR UPDATE ON "public"."bike_benefits" FOR EACH ROW EXECUTE FUNCTION "public"."update_bike_benefit_status"();
+
+
+
+CREATE OR REPLACE TRIGGER "update_bike_benefits_updated_at" BEFORE UPDATE ON "public"."bike_benefits" FOR EACH ROW EXECUTE FUNCTION "public"."update_updated_at_column"();
+
+
+
+CREATE OR REPLACE TRIGGER "update_bike_orders_updated_at" BEFORE UPDATE ON "public"."bike_orders" FOR EACH ROW EXECUTE FUNCTION "public"."update_updated_at_column"();
+
+
+
+CREATE OR REPLACE TRIGGER "update_bikes_updated_at" BEFORE UPDATE ON "public"."bikes" FOR EACH ROW EXECUTE FUNCTION "public"."update_updated_at_column"();
+
+
+
+CREATE OR REPLACE TRIGGER "update_contract_status_on_change" BEFORE INSERT OR UPDATE ON "public"."bike_benefits" FOR EACH ROW EXECUTE FUNCTION "public"."update_contract_status"();
+
+
+
+ALTER TABLE ONLY "public"."bike_benefits"
+    ADD CONSTRAINT "bike_benefits_bike_id_fkey" FOREIGN KEY ("bike_id") REFERENCES "public"."bikes"("id") ON DELETE SET NULL;
+
+
+
+ALTER TABLE ONLY "public"."bike_benefits"
+    ADD CONSTRAINT "bike_benefits_user_id_fkey" FOREIGN KEY ("user_id") REFERENCES "public"."profiles"("user_id") ON DELETE CASCADE;
+
+
+
+ALTER TABLE ONLY "public"."bike_orders"
+    ADD CONSTRAINT "bike_orders_bike_benefit_id_fkey" FOREIGN KEY ("bike_benefit_id") REFERENCES "public"."bike_benefits"("id") ON DELETE CASCADE;
+
+
+
+ALTER TABLE ONLY "public"."bike_orders"
+    ADD CONSTRAINT "bike_orders_user_id_fkey" FOREIGN KEY ("user_id") REFERENCES "public"."profiles"("user_id") ON DELETE CASCADE;
+
+
+
+ALTER TABLE ONLY "public"."contracts"
+    ADD CONSTRAINT "contracts_bike_benefit_id_fkey" FOREIGN KEY ("bike_benefit_id") REFERENCES "public"."bike_benefits"("id") ON DELETE CASCADE;
+
+
+
+ALTER TABLE ONLY "public"."contracts"
+    ADD CONSTRAINT "contracts_user_id_fkey" FOREIGN KEY ("user_id") REFERENCES "public"."profiles"("user_id") ON DELETE CASCADE;
+
+
+
+ALTER TABLE ONLY "public"."profile_invites"
+    ADD CONSTRAINT "profile_invites_company_id_fkey" FOREIGN KEY ("company_id") REFERENCES "public"."companies"("id");
+
+
+
+ALTER TABLE ONLY "public"."profile_invites"
+    ADD CONSTRAINT "profile_invites_user_id_fkey" FOREIGN KEY ("user_id") REFERENCES "public"."profiles"("user_id") ON DELETE SET NULL;
+
+
+
+ALTER TABLE ONLY "public"."profiles"
+    ADD CONSTRAINT "profiles_company_id_fkey" FOREIGN KEY ("company_id") REFERENCES "public"."companies"("id");
+
+
+
+ALTER TABLE ONLY "public"."profiles"
+    ADD CONSTRAINT "profiles_user_id_fkey" FOREIGN KEY ("user_id") REFERENCES "auth"."users"("id") ON DELETE CASCADE;
+
+
+
+ALTER TABLE ONLY "public"."user_roles"
+    ADD CONSTRAINT "user_roles_user_id_profiles_fkey" FOREIGN KEY ("user_id") REFERENCES "public"."profiles"("user_id") ON UPDATE CASCADE ON DELETE CASCADE;
+
+
+
+CREATE POLICY "Allow auth admin to read user roles" ON "public"."user_roles" FOR SELECT TO "supabase_auth_admin" USING (true);
+
+
+
+CREATE POLICY "Authenticated users can read permissions" ON "public"."role_permissions" FOR SELECT TO "authenticated" USING (true);
+
+
+
+CREATE POLICY "Enable read access for user own roles" ON "public"."user_roles" FOR SELECT USING (("auth"."uid"() = "user_id"));
+
+
+
+CREATE POLICY "HR can assign roles" ON "public"."user_roles" FOR INSERT TO "authenticated" WITH CHECK (((("auth"."jwt"() ->> 'user_role'::"text") = 'hr'::"text") OR (("auth"."jwt"() ->> 'user_role'::"text") = 'admin'::"text")));
+
+
+
+CREATE POLICY "HR can delete profile invites" ON "public"."profile_invites" FOR DELETE TO "authenticated" USING ((("auth"."jwt"() ->> 'user_role'::"text") = 'hr'::"text"));
+
+
+
+CREATE POLICY "HR can update profile invites" ON "public"."profile_invites" FOR UPDATE TO "authenticated" USING ((("auth"."jwt"() ->> 'user_role'::"text") = 'hr'::"text"));
+
+
+
+CREATE POLICY "HR can view profile invites" ON "public"."profile_invites" FOR SELECT TO "authenticated" USING ((("auth"."jwt"() ->> 'user_role'::"text") = 'hr'::"text"));
+
+
+
+CREATE POLICY "HR can view profiles" ON "public"."profiles" FOR SELECT TO "authenticated" USING ((("auth"."jwt"() ->> 'user_role'::"text") = 'hr'::"text"));
+
+
+
+CREATE POLICY "Hr can only add profile invites" ON "public"."profile_invites" FOR INSERT TO "authenticated" WITH CHECK ((("auth"."jwt"() ->> 'user_role'::"text") = 'hr'::"text"));
+
+
+
+CREATE POLICY "Users can read own role" ON "public"."user_roles" FOR SELECT TO "authenticated" USING (("auth"."uid"() = "user_id"));
+
+
+
+ALTER TABLE "public"."bike_benefits" ENABLE ROW LEVEL SECURITY;
+
+
+CREATE POLICY "bike_benefits_employee_insert" ON "public"."bike_benefits" FOR INSERT TO "authenticated" WITH CHECK (("user_id" = "auth"."uid"()));
+
+
+
+CREATE POLICY "bike_benefits_employee_select" ON "public"."bike_benefits" FOR SELECT TO "authenticated" USING (("user_id" = "auth"."uid"()));
+
+
+
+CREATE POLICY "bike_benefits_employee_update" ON "public"."bike_benefits" FOR UPDATE TO "authenticated" USING (("user_id" = "auth"."uid"())) WITH CHECK (("user_id" = "auth"."uid"()));
+
+
+
+CREATE POLICY "bike_benefits_hr_select" ON "public"."bike_benefits" FOR SELECT TO "authenticated" USING ((("auth"."jwt"() ->> 'user_role'::"text") = ANY (ARRAY['hr'::"text", 'admin'::"text"])));
+
+
+
+CREATE POLICY "bike_benefits_hr_update" ON "public"."bike_benefits" FOR UPDATE TO "authenticated" USING ((("auth"."jwt"() ->> 'user_role'::"text") = ANY (ARRAY['hr'::"text", 'admin'::"text"])));
+
+
+
+ALTER TABLE "public"."bike_orders" ENABLE ROW LEVEL SECURITY;
+
+
+CREATE POLICY "bike_orders_employee_insert" ON "public"."bike_orders" FOR INSERT TO "authenticated" WITH CHECK (("user_id" = "auth"."uid"()));
+
+
+
+CREATE POLICY "bike_orders_employee_select" ON "public"."bike_orders" FOR SELECT TO "authenticated" USING (("user_id" = "auth"."uid"()));
+
+
+
+CREATE POLICY "bike_orders_employee_update" ON "public"."bike_orders" FOR UPDATE TO "authenticated" USING (("user_id" = "auth"."uid"())) WITH CHECK (("user_id" = "auth"."uid"()));
+
+
+
+CREATE POLICY "bike_orders_hr_select" ON "public"."bike_orders" FOR SELECT TO "authenticated" USING ((("auth"."jwt"() ->> 'user_role'::"text") = ANY (ARRAY['hr'::"text", 'admin'::"text"])));
+
+
+
+CREATE POLICY "bike_orders_hr_update" ON "public"."bike_orders" FOR UPDATE TO "authenticated" USING ((("auth"."jwt"() ->> 'user_role'::"text") = ANY (ARRAY['hr'::"text", 'admin'::"text"])));
+
+
+
+ALTER TABLE "public"."bikes" ENABLE ROW LEVEL SECURITY;
+
+
+CREATE POLICY "bikes_authenticated_select" ON "public"."bikes" FOR SELECT TO "authenticated" USING (true);
+
+
+
+CREATE POLICY "bikes_hr_insert" ON "public"."bikes" FOR INSERT TO "authenticated" WITH CHECK ((("auth"."jwt"() ->> 'user_role'::"text") = ANY (ARRAY['hr'::"text", 'admin'::"text"])));
+
+
+
+CREATE POLICY "bikes_hr_update" ON "public"."bikes" FOR UPDATE TO "authenticated" USING ((("auth"."jwt"() ->> 'user_role'::"text") = ANY (ARRAY['hr'::"text", 'admin'::"text"])));
+
+
+
+ALTER TABLE "public"."companies" ENABLE ROW LEVEL SECURITY;
+
+
+CREATE POLICY "companies_employee_select" ON "public"."companies" FOR SELECT TO "authenticated" USING (("id" IN ( SELECT "profiles"."company_id"
+   FROM "public"."profiles"
+  WHERE ("profiles"."user_id" = "auth"."uid"()))));
+
+
+
+CREATE POLICY "companies_hr_update" ON "public"."companies" FOR UPDATE TO "authenticated" USING (((("auth"."jwt"() ->> 'user_role'::"text") = ANY (ARRAY['hr'::"text", 'admin'::"text"])) AND ("id" IN ( SELECT "profiles"."company_id"
+   FROM "public"."profiles"
+  WHERE ("profiles"."user_id" = "auth"."uid"())))));
+
+
+
+ALTER TABLE "public"."contracts" ENABLE ROW LEVEL SECURITY;
+
+
+CREATE POLICY "contracts_employee_select_own" ON "public"."contracts" FOR SELECT TO "authenticated" USING (("user_id" = "auth"."uid"()));
+
+
+
+CREATE POLICY "contracts_hr_admin_select" ON "public"."contracts" FOR SELECT TO "authenticated" USING ((EXISTS ( SELECT 1
+   FROM "public"."user_roles" "ur"
+  WHERE (("ur"."user_id" = "auth"."uid"()) AND ("ur"."role" = ANY (ARRAY['hr'::"public"."user_role", 'admin'::"public"."user_role"]))))));
+
+
+
+ALTER TABLE "public"."profile_invites" ENABLE ROW LEVEL SECURITY;
+
+
+ALTER TABLE "public"."profiles" ENABLE ROW LEVEL SECURITY;
+
+
+CREATE POLICY "profiles_hr_insert" ON "public"."profiles" FOR INSERT TO "authenticated" WITH CHECK ((("auth"."jwt"() ->> 'user_role'::"text") = 'hr'::"text"));
+
+
+
+CREATE POLICY "profiles_self_select" ON "public"."profiles" FOR SELECT TO "authenticated" USING (("user_id" = ( SELECT "auth"."uid"() AS "uid")));
+
+
+
+CREATE POLICY "profiles_self_update" ON "public"."profiles" FOR UPDATE TO "authenticated" USING (("user_id" = ( SELECT "auth"."uid"() AS "uid"))) WITH CHECK (("user_id" = ( SELECT "auth"."uid"() AS "uid")));
+
+
+
+ALTER TABLE "public"."role_permissions" ENABLE ROW LEVEL SECURITY;
+
+
+ALTER TABLE "public"."user_roles" ENABLE ROW LEVEL SECURITY;
+
+
+
+
+ALTER PUBLICATION "supabase_realtime" OWNER TO "postgres";
+
+
+
+
+
+GRANT USAGE ON SCHEMA "public" TO "postgres";
+GRANT USAGE ON SCHEMA "public" TO "anon";
+GRANT USAGE ON SCHEMA "public" TO "authenticated";
+GRANT USAGE ON SCHEMA "public" TO "service_role";
+GRANT USAGE ON SCHEMA "public" TO "supabase_auth_admin";
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+GRANT ALL ON FUNCTION "public"."auth_company_id"() TO "anon";
+GRANT ALL ON FUNCTION "public"."auth_company_id"() TO "authenticated";
+GRANT ALL ON FUNCTION "public"."auth_company_id"() TO "service_role";
+
+
+
+GRANT ALL ON FUNCTION "public"."authorize"("requested_permission" "public"."user_role_permissions") TO "anon";
+GRANT ALL ON FUNCTION "public"."authorize"("requested_permission" "public"."user_role_permissions") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."authorize"("requested_permission" "public"."user_role_permissions") TO "service_role";
+
+
+
+GRANT ALL ON FUNCTION "public"."calc_employee_prices"("p_full_price" numeric, "p_monthly_subsidy" numeric, "p_contract_months" integer) TO "anon";
+GRANT ALL ON FUNCTION "public"."calc_employee_prices"("p_full_price" numeric, "p_monthly_subsidy" numeric, "p_contract_months" integer) TO "authenticated";
+GRANT ALL ON FUNCTION "public"."calc_employee_prices"("p_full_price" numeric, "p_monthly_subsidy" numeric, "p_contract_months" integer) TO "service_role";
+
+
+
+GRANT ALL ON FUNCTION "public"."calculate_employee_bike_price"("p_full_price" numeric, "p_company_id" "uuid") TO "anon";
+GRANT ALL ON FUNCTION "public"."calculate_employee_bike_price"("p_full_price" numeric, "p_company_id" "uuid") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."calculate_employee_bike_price"("p_full_price" numeric, "p_company_id" "uuid") TO "service_role";
+
+
+
+REVOKE ALL ON FUNCTION "public"."custom_access_token_hook"("event" "jsonb") FROM PUBLIC;
+GRANT ALL ON FUNCTION "public"."custom_access_token_hook"("event" "jsonb") TO "service_role";
+GRANT ALL ON FUNCTION "public"."custom_access_token_hook"("event" "jsonb") TO "supabase_auth_admin";
+
+
+
+GRANT ALL ON FUNCTION "public"."get_company_terms_for_user"("p_user_id" "uuid") TO "anon";
+GRANT ALL ON FUNCTION "public"."get_company_terms_for_user"("p_user_id" "uuid") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."get_company_terms_for_user"("p_user_id" "uuid") TO "service_role";
+
+
+
+GRANT ALL ON FUNCTION "public"."get_my_company_user_ids"() TO "anon";
+GRANT ALL ON FUNCTION "public"."get_my_company_user_ids"() TO "authenticated";
+GRANT ALL ON FUNCTION "public"."get_my_company_user_ids"() TO "service_role";
+
+
+
+GRANT ALL ON FUNCTION "public"."get_my_role"() TO "anon";
+GRANT ALL ON FUNCTION "public"."get_my_role"() TO "authenticated";
+GRANT ALL ON FUNCTION "public"."get_my_role"() TO "service_role";
+
+
+
+GRANT ALL ON FUNCTION "public"."get_vault_secret"("secret_name" "text") TO "anon";
+GRANT ALL ON FUNCTION "public"."get_vault_secret"("secret_name" "text") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."get_vault_secret"("secret_name" "text") TO "service_role";
+
+
+
+GRANT ALL ON FUNCTION "public"."handle_user_registration"() TO "anon";
+GRANT ALL ON FUNCTION "public"."handle_user_registration"() TO "authenticated";
+GRANT ALL ON FUNCTION "public"."handle_user_registration"() TO "service_role";
+
+
+
+GRANT ALL ON FUNCTION "public"."sync_profile_email"() TO "anon";
+GRANT ALL ON FUNCTION "public"."sync_profile_email"() TO "authenticated";
+GRANT ALL ON FUNCTION "public"."sync_profile_email"() TO "service_role";
+
+
+
+GRANT ALL ON FUNCTION "public"."update_bike_benefit_status"() TO "anon";
+GRANT ALL ON FUNCTION "public"."update_bike_benefit_status"() TO "authenticated";
+GRANT ALL ON FUNCTION "public"."update_bike_benefit_status"() TO "service_role";
+
+
+
+GRANT ALL ON FUNCTION "public"."update_contract_status"() TO "anon";
+GRANT ALL ON FUNCTION "public"."update_contract_status"() TO "authenticated";
+GRANT ALL ON FUNCTION "public"."update_contract_status"() TO "service_role";
+
+
+
+GRANT ALL ON FUNCTION "public"."update_updated_at_column"() TO "anon";
+GRANT ALL ON FUNCTION "public"."update_updated_at_column"() TO "authenticated";
+GRANT ALL ON FUNCTION "public"."update_updated_at_column"() TO "service_role";
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+GRANT ALL ON TABLE "public"."bike_benefits" TO "anon";
+GRANT ALL ON TABLE "public"."bike_benefits" TO "authenticated";
+GRANT ALL ON TABLE "public"."bike_benefits" TO "service_role";
+
+
+
+GRANT ALL ON TABLE "public"."bike_orders" TO "anon";
+GRANT ALL ON TABLE "public"."bike_orders" TO "authenticated";
+GRANT ALL ON TABLE "public"."bike_orders" TO "service_role";
+
+
+
+GRANT ALL ON TABLE "public"."bikes" TO "anon";
+GRANT ALL ON TABLE "public"."bikes" TO "authenticated";
+GRANT ALL ON TABLE "public"."bikes" TO "service_role";
+
+
+
+GRANT ALL ON TABLE "public"."companies" TO "anon";
+GRANT ALL ON TABLE "public"."companies" TO "authenticated";
+GRANT ALL ON TABLE "public"."companies" TO "service_role";
+
+
+
+GRANT ALL ON TABLE "public"."profiles" TO "anon";
+GRANT ALL ON TABLE "public"."profiles" TO "authenticated";
+GRANT ALL ON TABLE "public"."profiles" TO "service_role";
+
+
+
+GRANT ALL ON TABLE "public"."bikes_with_my_pricing" TO "anon";
+GRANT ALL ON TABLE "public"."bikes_with_my_pricing" TO "authenticated";
+GRANT ALL ON TABLE "public"."bikes_with_my_pricing" TO "service_role";
+
+
+
+GRANT ALL ON TABLE "public"."contracts" TO "anon";
+GRANT ALL ON TABLE "public"."contracts" TO "authenticated";
+GRANT ALL ON TABLE "public"."contracts" TO "service_role";
+
+
+
+GRANT ALL ON TABLE "public"."profile_invites" TO "anon";
+GRANT ALL ON TABLE "public"."profile_invites" TO "authenticated";
+GRANT ALL ON TABLE "public"."profile_invites" TO "service_role";
+
+
+
+GRANT ALL ON TABLE "public"."profile_invites_with_details" TO "anon";
+GRANT ALL ON TABLE "public"."profile_invites_with_details" TO "authenticated";
+GRANT ALL ON TABLE "public"."profile_invites_with_details" TO "service_role";
+
+
+
+GRANT ALL ON TABLE "public"."role_permissions" TO "anon";
+GRANT ALL ON TABLE "public"."role_permissions" TO "authenticated";
+GRANT ALL ON TABLE "public"."role_permissions" TO "service_role";
+
+
+
+GRANT ALL ON SEQUENCE "public"."role_permissions_id_seq" TO "anon";
+GRANT ALL ON SEQUENCE "public"."role_permissions_id_seq" TO "authenticated";
+GRANT ALL ON SEQUENCE "public"."role_permissions_id_seq" TO "service_role";
+
+
+
+GRANT ALL ON TABLE "public"."user_roles" TO "service_role";
+GRANT ALL ON TABLE "public"."user_roles" TO "supabase_auth_admin";
+
+
+
+GRANT ALL ON SEQUENCE "public"."user_roles_id_seq" TO "anon";
+GRANT ALL ON SEQUENCE "public"."user_roles_id_seq" TO "authenticated";
+GRANT ALL ON SEQUENCE "public"."user_roles_id_seq" TO "service_role";
+
+
+
+
+
+
+
+
+
+ALTER DEFAULT PRIVILEGES FOR ROLE "postgres" IN SCHEMA "public" GRANT ALL ON SEQUENCES TO "postgres";
+ALTER DEFAULT PRIVILEGES FOR ROLE "postgres" IN SCHEMA "public" GRANT ALL ON SEQUENCES TO "anon";
+ALTER DEFAULT PRIVILEGES FOR ROLE "postgres" IN SCHEMA "public" GRANT ALL ON SEQUENCES TO "authenticated";
+ALTER DEFAULT PRIVILEGES FOR ROLE "postgres" IN SCHEMA "public" GRANT ALL ON SEQUENCES TO "service_role";
+
+
+
+
+
+
+ALTER DEFAULT PRIVILEGES FOR ROLE "postgres" IN SCHEMA "public" GRANT ALL ON FUNCTIONS TO "postgres";
+ALTER DEFAULT PRIVILEGES FOR ROLE "postgres" IN SCHEMA "public" GRANT ALL ON FUNCTIONS TO "anon";
+ALTER DEFAULT PRIVILEGES FOR ROLE "postgres" IN SCHEMA "public" GRANT ALL ON FUNCTIONS TO "authenticated";
+ALTER DEFAULT PRIVILEGES FOR ROLE "postgres" IN SCHEMA "public" GRANT ALL ON FUNCTIONS TO "service_role";
+
+
+
+
+
+
+ALTER DEFAULT PRIVILEGES FOR ROLE "postgres" IN SCHEMA "public" GRANT ALL ON TABLES TO "postgres";
+ALTER DEFAULT PRIVILEGES FOR ROLE "postgres" IN SCHEMA "public" GRANT ALL ON TABLES TO "anon";
+ALTER DEFAULT PRIVILEGES FOR ROLE "postgres" IN SCHEMA "public" GRANT ALL ON TABLES TO "authenticated";
+ALTER DEFAULT PRIVILEGES FOR ROLE "postgres" IN SCHEMA "public" GRANT ALL ON TABLES TO "service_role";
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
