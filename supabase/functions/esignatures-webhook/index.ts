@@ -1,7 +1,9 @@
 // Setup type definitions for built-in Supabase Runtime APIs
 import "jsr:@supabase/functions-js/edge-runtime.d.ts"
-import { ESIGNATURES_VAULT_KEY, EsigEvents } from "../_shared/constants.ts"
+import { ESIGNATURES_VAULT_KEY, EsigEvents, NotificationEvent, UserRoles } from "../_shared/constants.ts"
 import { makeRestClient, RestClient } from "../_shared/supabaseRest.ts"
+import { sendFcm } from "../_shared/fcm.ts"
+import { sendBroadcast } from "../_shared/broadcast.ts"
 
 // Deployed with verify_jwt: false — authentication is via HMAC-SHA256 signature.
 
@@ -34,15 +36,60 @@ async function computeHmac(body: string, apiKey: string): Promise<string> {
     .join("")
 }
 
-function parsePayload(body: string): { event: string; contractId: string } | null {
+function parsePayload(body: string): { event: string; contractId: string; signerEmail: string | null } | null {
   try {
     const payload = JSON.parse(body)
     const event      = payload?.status as string | undefined
     const contractId = payload?.data?.contract?.id as string | undefined
+    const signerEmail = (payload?.data?.signer?.email as string | undefined) ?? null
     if (!event || !contractId) return null
-    return { event, contractId }
+    return { event, contractId, signerEmail }
   } catch {
     return null
+  }
+}
+
+// ─── Notifications ───────────────────────────────────────────────────────────
+
+async function sendWebhookNotifications(
+  db: RestClient,
+  event: string,
+  signerEmail: string,
+  contract: { id: string; bike_benefit_id: string; user_id: string },
+): Promise<void> {
+  const signer = await db.getOne<{ user_id: string; company_id: string; first_name: string; last_name: string; user_roles: { role: string }[] }>(
+    "profiles",
+    `email=eq.${encodeURIComponent(signerEmail)}`,
+    "user_id,company_id,first_name,last_name,user_roles(role)"
+  )
+  if (!signer) return
+
+  const role = signer.user_roles?.[0]?.role
+
+  if (role === UserRoles.HR) {
+    // HR signed → notify employee via FCM only
+    const notification = event === EsigEvents.SIGNED
+      ? { title: "Contract Signed", body: "HR has signed your contract.", event: NotificationEvent.CONTRACT_SIGNED_HR, bikeBenefitId: contract.bike_benefit_id }
+      : event === EsigEvents.CONTRACT_SIGNED
+      ? { title: "Contract Approved", body: "Your contract has been fully approved!", event: NotificationEvent.CONTRACT_APPROVED, bikeBenefitId: contract.bike_benefit_id }
+      : null
+
+    if (notification) {
+      sendFcm(db, contract.user_id, notification)
+        .catch((err) => console.error("[webhook] fcm error:", err))
+    }
+  } else if (role === UserRoles.EMPLOYEE && signer.company_id) {
+    // Employee acted → broadcast to HR dashboard only
+    sendBroadcast(
+      `notifications:${signer.company_id}`,
+      "contract_update",
+      {
+        user_id: contract.user_id,
+        employee_name: `${signer.first_name} ${signer.last_name}`.trim(),
+        event_type: event,
+        contract_id: contract.id,
+      },
+    ).catch((err) => console.error("[webhook] broadcast error:", err))
   }
 }
 
@@ -86,10 +133,10 @@ Deno.serve(async (req) => {
   console.log("[webhook] event:", parsed.event, "contractId:", parsed.contractId)
 
   // 4. Look up contract row
-  const contract = await db.getOne<{ id: string; bike_benefit_id: string }>(
+  const contract = await db.getOne<{ id: string; bike_benefit_id: string; user_id: string }>(
     "contracts",
     `esignatures_contract_id=eq.${encodeURIComponent(parsed.contractId)}`,
-    "id,bike_benefit_id"
+    "id,bike_benefit_id,user_id"
   )
   if (!contract) {
     console.error("[webhook] contract not found for esignatures_contract_id:", parsed.contractId)
@@ -114,6 +161,12 @@ Deno.serve(async (req) => {
     console.log("[webhook] updated bike_benefits columns:", Object.keys(updates).join(", "))
   } else {
     console.log("[webhook] event logged only (no timestamp mapping):", parsed.event)
+  }
+
+  // 7. Send notifications based on signer role
+  if (parsed.signerEmail) {
+    sendWebhookNotifications(db, parsed.event, parsed.signerEmail, contract)
+      .catch((err) => console.error("[webhook] notification error:", err))
   }
 
   return ok()

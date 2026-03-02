@@ -109,6 +109,35 @@ Each `send-contract` call creates a row in the `contracts` table storing the eSi
 
 ---
 
+## Notifications
+
+### Push Notifications (FCM)
+- Uses **Firebase Cloud Messaging HTTP v1 API** (no SDK, just fetch).
+- Service account JSON stored in Supabase Vault as `firebase_service_account`.
+- `firebase_project_id` stored in Supabase Vault as `firebase_project_id`.
+- Employee's FCM token stored in `profiles.fcm_token` — updated by mobile app, cleared on logout.
+
+### Notification Events (`notification_event` enum)
+| Event | Trigger | Recipient | Channel |
+|-------|---------|-----------|---------|
+| `contract_ready` | `send-contract` called | Employee | FCM |
+| `contract_signed_hr` | Webhook: HR signs | Employee | FCM |
+| `contract_approved` | Webhook: contract fully signed | Employee | FCM |
+| *(broadcast)* | Webhook: Employee views/signs/declines | HR dashboard | Supabase Realtime Broadcast |
+
+### FCM Data Payload
+All FCM messages include a `data` field with `event` (notification type for localization) and `bike_benefit_id` so the mobile client can reload the relevant bike benefit screen in real time. The `notification` field provides English fallback text only.
+
+### Realtime Broadcast (Web)
+- HR dashboard subscribes to `notifications:{company_id}` channel.
+- Broadcast event: `contract_update` with payload `{ user_id, employee_name, event_type, contract_id }`.
+- Sent via Supabase Realtime REST API (`/realtime/v1/api/broadcast`).
+
+### Signer Identification
+Webhook payload `data.signer.email` is matched against `profiles` + `user_roles` to determine role and route the notification accordingly.
+
+---
+
 ## Edge Functions
 
 | Function | Caller | CORS | Auth |
@@ -135,5 +164,7 @@ Each `send-contract` call creates a row in the `contracts` table storing the eSi
 | Key | Where | Used by |
 |-----|-------|---------|
 | `esignature_api_key` | Supabase Vault | `send-contract`, `esignatures-webhook` |
+| `firebase_service_account` | Supabase Vault | `send-contract`, `esignatures-webhook` (FCM) |
+| `firebase_project_id` | Supabase Vault | `send-contract`, `esignatures-webhook` (FCM) |
 | `ALLOWED_ORIGINS` | Supabase secrets | `bulk-create` |
 | `esignatures_template_id` | `companies` table | `send-contract` |

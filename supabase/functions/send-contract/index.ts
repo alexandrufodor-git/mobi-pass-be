@@ -1,9 +1,10 @@
 // Setup type definitions for built-in Supabase Runtime APIs
 import "jsr:@supabase/functions-js/edge-runtime.d.ts"
-import { Errors, ESIGNATURES_API_URL, ESIGNATURES_VAULT_KEY, badRequest, json } from "../_shared/constants.ts"
+import { Errors, ESIGNATURES_API_URL, ESIGNATURES_VAULT_KEY, NotificationEvent, badRequest, json } from "../_shared/constants.ts"
 import { corsResponse } from "../_shared/ioHelpers.ts"
 import { requireJwt, extractUserId } from "../_shared/auth.ts"
 import { makeRestClient, RestClient } from "../_shared/supabaseRest.ts"
+import { sendFcm } from "../_shared/fcm.ts"
 
 // ─── Types ───────────────────────────────────────────────────────────────────
 
@@ -230,6 +231,14 @@ Deno.serve(async (req) => {
       contract_requested_at: new Date().toISOString(),
       step: "pickup_delivery",
     })
+
+    // Fire-and-forget FCM push to employee
+    sendFcm(db, userId, {
+      title: "Contract Ready",
+      body: "Your contract is ready. Check your email to view and sign.",
+      event: NotificationEvent.CONTRACT_READY,
+      bikeBenefitId: benefit.id,
+    }).catch((err) => console.error("[send-contract] fcm error:", err))
 
     return json({ success: true, contract_id: esigResult.contractId, sign_page_url: esigResult.signPageUrl }, 200, origin)
   } catch (e) {

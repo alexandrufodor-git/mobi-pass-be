@@ -153,6 +153,16 @@ COMMENT ON TYPE "public"."currency_type" IS 'Supported currencies. EUR: symbol â
 
 
 
+CREATE TYPE "public"."notification_event" AS ENUM (
+    'contract_ready',
+    'contract_signed_hr',
+    'contract_approved'
+);
+
+
+ALTER TYPE "public"."notification_event" OWNER TO "postgres";
+
+
 CREATE TYPE "public"."user_profile_status" AS ENUM (
     'active',
     'inactive'
@@ -885,7 +895,8 @@ CREATE TABLE IF NOT EXISTS "public"."profiles" (
     "last_name" "text" NOT NULL,
     "description" "text",
     "department" "text",
-    "hire_date" bigint
+    "hire_date" bigint,
+    "fcm_token" "text"
 );
 
 
@@ -1522,6 +1533,10 @@ ALTER TABLE "public"."user_roles" ENABLE ROW LEVEL SECURITY;
 
 
 ALTER PUBLICATION "supabase_realtime" OWNER TO "postgres";
+
+
+ALTER PUBLICATION "supabase_realtime" ADD TABLE ONLY "public"."bike_benefits";
+
 
 
 

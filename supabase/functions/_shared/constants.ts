@@ -25,6 +25,9 @@ export function getCorsHeaders(origin?: string): Record<string, string> {
 export const ESIGNATURES_API_URL  = "https://esignatures.com/api/contracts"
 export const ESIGNATURES_VAULT_KEY = "esignature_api_key"
 
+// Firebase Cloud Messaging
+export const FIREBASE_VAULT_KEY = "firebase_service_account"
+
 export const EsigEvents = {
   VIEWED:          "signer-viewed-the-contract",
   SIGNED:          "signer-signed",
@@ -40,6 +43,16 @@ export const UserRoles = {
 } as const
 
 export type UserRole = typeof UserRoles[keyof typeof UserRoles]
+
+// Notification event types — mirrors public.notification_event enum in DB.
+// Mobile clients use these keys in FCM data payload for localization.
+export const NotificationEvent = {
+  CONTRACT_READY:     "contract_ready",
+  CONTRACT_SIGNED_HR: "contract_signed_hr",
+  CONTRACT_APPROVED:  "contract_approved",
+} as const
+
+export type NotificationEventType = typeof NotificationEvent[keyof typeof NotificationEvent]
 
 // Centralized error responses
 export const Errors = {
@@ -71,6 +84,9 @@ export const Errors = {
   NO_TEMPLATE: { error: "no_esignatures_template" },
   CONTRACT_ALREADY_REQUESTED: { error: "contract_already_requested" },
   ESIGNATURES_API_FAILED: { error: "esignatures_api_failed" },
+  // Notification errors (non-fatal, logged only)
+  FCM_SEND_FAILED: { error: "fcm_send_failed" },
+  BROADCAST_FAILED: { error: "broadcast_failed" },
 } as const
 
 export function forbidden(error = Errors.FORBIDDEN, origin?: string): Response {
