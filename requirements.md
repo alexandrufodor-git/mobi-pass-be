@@ -102,6 +102,7 @@ Each `send-contract` call creates a row in the `contracts` table storing the eSi
 - Guards: bike selected, pricing committed (`employee_full_price` set), no existing `contract_requested_at`.
 - Signers: employee (order 1) + HR of same company (order 2).
 - On success: sets `contract_requested_at`, advances `step` to `pickup_delivery`, returns `sign_page_url` to app.
+- Fires broadcast to `notifications:{company_id}` with `event_type: "created"` so HR dashboard is notified immediately.
 - Currently calls eSignatures in **test mode** (`test: true` hardcoded).
 
 ### eSignatures Placeholder Fields
@@ -123,15 +124,24 @@ Each `send-contract` call creates a row in the `contracts` table storing the eSi
 | `contract_ready` | `send-contract` called | Employee | FCM |
 | `contract_signed_hr` | Webhook: HR signs | Employee | FCM |
 | `contract_approved` | Webhook: contract fully signed | Employee | FCM |
+| *(broadcast)* | `send-contract` called | HR dashboard | Supabase Realtime Broadcast |
 | *(broadcast)* | Webhook: Employee views/signs/declines | HR dashboard | Supabase Realtime Broadcast |
+| *(broadcast)* | User registration trigger | HR dashboard | Supabase Realtime Broadcast |
 
 ### FCM Data Payload
 All FCM messages include a `data` field with `event` (notification type for localization) and `bike_benefit_id` so the mobile client can reload the relevant bike benefit screen in real time. The `notification` field provides English fallback text only.
 
 ### Realtime Broadcast (Web)
 - HR dashboard subscribes to `notifications:{company_id}` channel.
-- Broadcast event: `contract_update` with payload `{ user_id, employee_name, event_type, contract_id }`.
-- Sent via Supabase Realtime REST API (`/realtime/v1/api/broadcast`).
+- **`contract_update`** event: payload `{ user_id, employee_name, event_type, contract_id }`.
+  - `event_type` values: `"created"` (new contract sent), `"viewed_by_employee"`, `"signed_by_employee"`, `"declined_by_employee"` (mapped from eSignatures event strings via `EsigToContractStatus`).
+  - Sent by: `send-contract` (on creation) and `esignatures-webhook` (on employee action).
+- **`user_update`** event: payload `{ user_id, employee_name, event_type: "created" }`.
+  - Sent by: `handle_user_registration` trigger → calls `notify-user-registration` edge function via `pg_net`.
+- All broadcasts sent via Supabase Realtime REST API (`/realtime/v1/api/broadcast`).
+- `notify-user-registration` is an internal-only edge function (`verify_jwt: false`), protected by an `x-webhook-secret` header checked against the `BROADCAST_WEBHOOK_SECRET` env var. The service role key never leaves the edge function runtime.
+- Trigger reads `broadcast_webhook_secret` from Supabase Vault at runtime (scoped token — zero DB access if leaked). Project URL is hardcoded in the trigger (it's public).
+- **One-time setup**: add `broadcast_webhook_secret` to Vault, and set `BROADCAST_WEBHOOK_SECRET` edge function env var to the same value.
 
 ### Signer Identification
 Webhook payload `data.signer.email` is matched against `profiles` + `user_roles` to determine role and route the notification accordingly.
@@ -146,6 +156,7 @@ Webhook payload `data.signer.email` is matched against `profiles` + `user_roles`
 | `bulk-create` | Web frontend | Yes | JWT + HR/Admin role |
 | `send-contract` | Mobile app | No | JWT (employee) |
 | `esignatures-webhook` | eSignatures.com | No | HMAC-SHA256 |
+| `notify-user-registration` | DB trigger (pg_net) | No | Shared secret (`x-webhook-secret`) |
 
 ---
 
@@ -168,3 +179,5 @@ Webhook payload `data.signer.email` is matched against `profiles` + `user_roles`
 | `firebase_project_id` | Supabase Vault | `send-contract`, `esignatures-webhook` (FCM) |
 | `ALLOWED_ORIGINS` | Supabase secrets | `bulk-create` |
 | `esignatures_template_id` | `companies` table | `send-contract` |
+| `broadcast_webhook_secret` | Supabase Vault + edge function env var | `notify-user-registration` (trigger auth) |
+| `BROADCAST_WEBHOOK_SECRET` | Supabase edge function secrets | `notify-user-registration` |

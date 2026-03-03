@@ -5,6 +5,7 @@ import { corsResponse } from "../_shared/ioHelpers.ts"
 import { requireJwt, extractUserId } from "../_shared/auth.ts"
 import { makeRestClient, RestClient } from "../_shared/supabaseRest.ts"
 import { sendFcm } from "../_shared/fcm.ts"
+import { sendBroadcast } from "../_shared/broadcast.ts"
 
 // ─── Types ───────────────────────────────────────────────────────────────────
 
@@ -231,6 +232,18 @@ Deno.serve(async (req) => {
       contract_requested_at: new Date().toISOString(),
       step: "pickup_delivery",
     })
+
+    // Fire-and-forget broadcast to HR dashboard
+    sendBroadcast(
+      `notifications:${profile.company_id}`,
+      "contract_update",
+      {
+        user_id: userId,
+        employee_name: `${profile.first_name} ${profile.last_name}`.trim(),
+        event_type: "created",
+        contract_id: esigResult.contractId,
+      },
+    ).catch((err) => console.error("[send-contract] broadcast error:", err))
 
     // Fire-and-forget FCM push to employee
     sendFcm(db, userId, {

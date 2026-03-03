@@ -1,6 +1,6 @@
 // Setup type definitions for built-in Supabase Runtime APIs
 import "jsr:@supabase/functions-js/edge-runtime.d.ts"
-import { ESIGNATURES_VAULT_KEY, EsigEvents, NotificationEvent, UserRoles } from "../_shared/constants.ts"
+import { ESIGNATURES_VAULT_KEY, EsigEvents, EsigToContractStatus, NotificationEvent, UserRoles } from "../_shared/constants.ts"
 import { makeRestClient, RestClient } from "../_shared/supabaseRest.ts"
 import { sendFcm } from "../_shared/fcm.ts"
 import { sendBroadcast } from "../_shared/broadcast.ts"
@@ -86,7 +86,7 @@ async function sendWebhookNotifications(
       {
         user_id: contract.user_id,
         employee_name: `${signer.first_name} ${signer.last_name}`.trim(),
-        event_type: event,
+        event_type: EsigToContractStatus[event] ?? event,
         contract_id: contract.id,
       },
     ).catch((err) => console.error("[webhook] broadcast error:", err))

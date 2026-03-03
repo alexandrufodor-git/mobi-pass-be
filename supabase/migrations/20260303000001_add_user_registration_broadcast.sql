@@ -1,27 +1,7 @@
--- ============================================================================
--- User Registration Trigger
--- ============================================================================
--- This trigger handles automatic user setup when a new user registers or
--- updates their password after OTP verification.
---
--- Actions performed:
--- 1. Assigns 'employee' role to new users
--- 2. Creates/updates profile record
--- 3. Sets profile_invites status to 'active'
--- 4. Creates a bike benefit record for the user
---
--- Triggers:
--- - on_auth_user_created: Fires when user verifies OTP (email_confirmed_at set)
--- - on_auth_user_updated: Fires when user sets/changes password
--- ============================================================================
+-- Re-create handle_user_registration() with pg_net broadcast (step 6).
+-- Sends a user_update event to notifications:{company_id} on Supabase Realtime
+-- after a new employee profile is created, so the HR dashboard is notified in real time.
 
--- Drop existing triggers if they exist
-DROP TRIGGER IF EXISTS on_auth_user_created ON auth.users;
-DROP TRIGGER IF EXISTS on_auth_user_updated ON auth.users;
-
--- Create or replace the trigger function
--- NOTE: Must use fully qualified type names (public.user_role, public.user_profile_status)
--- because this trigger runs in auth schema context, not public schema context
 CREATE OR REPLACE FUNCTION public.handle_user_registration()
 RETURNS TRIGGER AS $$
 DECLARE
@@ -37,14 +17,14 @@ BEGIN
   IF NEW.email_confirmed_at IS NOT NULL THEN
 
     -- 1. Resolve company_id and employee fields from profile_invites
-    SELECT 
+    SELECT
       pi.company_id,
       pi.first_name,
       pi.last_name,
       pi.description,
       pi.department,
       pi.hire_date
-    INTO 
+    INTO
       v_company_id,
       v_first_name,
       v_last_name,
@@ -60,19 +40,18 @@ BEGIN
       RAISE EXCEPTION
         'No active invite found for email %',
         NEW.email;
-      -- or: RETURN NEW;  -- if you want silent failure
     END IF;
-    
+
     -- 2. Automatically assign 'employee' role to new users
     INSERT INTO public.user_roles (user_id, role)
     VALUES (NEW.id, 'employee'::public.user_role)
     ON CONFLICT (user_id, role) DO NOTHING;
-    
+
     -- 3. Create or update profile with employee fields
     INSERT INTO public.profiles (
-      user_id, 
-      email, 
-      status, 
+      user_id,
+      email,
+      status,
       company_id,
       first_name,
       last_name,
@@ -81,9 +60,9 @@ BEGIN
       hire_date
     )
     VALUES (
-      NEW.id, 
-      NEW.email, 
-      'active'::public.user_profile_status, 
+      NEW.id,
+      NEW.email,
+      'active'::public.user_profile_status,
       v_company_id,
       v_first_name,
       v_last_name,
@@ -91,8 +70,8 @@ BEGIN
       v_department,
       v_hire_date
     )
-    ON CONFLICT (user_id) 
-    DO UPDATE SET 
+    ON CONFLICT (user_id)
+    DO UPDATE SET
       email = EXCLUDED.email,
       status = 'active'::public.user_profile_status,
       company_id = EXCLUDED.company_id,
@@ -101,12 +80,12 @@ BEGIN
       description = EXCLUDED.description,
       department = EXCLUDED.department,
       hire_date = EXCLUDED.hire_date;
-    
+
     -- 4. Update profile_invites status to 'active'
     UPDATE public.profile_invites
     SET status = 'active'::public.user_profile_status
     WHERE LOWER(email) = LOWER(NEW.email);
-    
+
     -- 5. Create a bike benefit for the user
     INSERT INTO public.bike_benefits (user_id)
     VALUES (NEW.id)
@@ -122,7 +101,8 @@ BEGIN
 
     IF v_webhook_secret IS NOT NULL THEN
       PERFORM net.http_post(
-        url     := 'https://xlfkdumbsflqxpezolhl.supabase.co/functions/v1/notify-user-registration',
+        url     := current_setting('app.settings.supabase_url')
+                    || '/functions/v1/notify-user-registration',
         headers := jsonb_build_object(
           'Content-Type',    'application/json',
           'x-webhook-secret', v_webhook_secret
@@ -131,33 +111,14 @@ BEGIN
           'company_id',    v_company_id,
           'user_id',       NEW.id,
           'employee_name', v_first_name || ' ' || v_last_name
-        )
+        )::text
       );
     ELSE
       RAISE WARNING '[handle_user_registration] Vault secret "broadcast_webhook_secret" not found — user_update broadcast skipped';
     END IF;
 
   END IF;
-  
+
   RETURN NEW;
 END;
 $$ LANGUAGE plpgsql SECURITY DEFINER;
-
--- Create trigger for new user creation (when OTP is verified AND password is set)
-CREATE TRIGGER on_auth_user_created
-  AFTER INSERT ON auth.users
-  FOR EACH ROW
-  WHEN (NEW.email_confirmed_at IS NOT NULL AND NEW.encrypted_password IS NOT NULL)
-  EXECUTE FUNCTION public.handle_user_registration();
-
--- Create trigger for user updates (when password is set/changed)
-CREATE TRIGGER on_auth_user_updated
-  AFTER UPDATE ON auth.users
-  FOR EACH ROW
-  WHEN (
-    NEW.email_confirmed_at IS NOT NULL AND 
-    NEW.encrypted_password IS NOT NULL AND
-    OLD.encrypted_password IS DISTINCT FROM NEW.encrypted_password
-  )
-  EXECUTE FUNCTION public.handle_user_registration();
-

@@ -36,6 +36,13 @@ export const EsigEvents = {
   CONTRACT_SIGNED: "contract-signed",
 } as const
 
+// Maps eSignatures event → contract_status value sent in broadcast event_type
+export const EsigToContractStatus: Partial<Record<string, string>> = {
+  [EsigEvents.VIEWED]:   "viewed_by_employee",
+  [EsigEvents.SIGNED]:   "signed_by_employee",
+  [EsigEvents.DECLINED]: "declined_by_employee",
+}
+
 export const UserRoles = {
   ADMIN: "admin",
   HR: "hr",
