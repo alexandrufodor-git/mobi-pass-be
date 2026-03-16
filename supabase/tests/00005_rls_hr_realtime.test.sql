@@ -88,15 +88,15 @@ SELECT ok(
 
 RESET ROLE;
 
--- ── T04: realtime.messages RLS policy exists ──────────────────────────────────
+-- ── T04: company_notifications RLS policy exists ──────────────────────────────
 SELECT ok(
   EXISTS(
     SELECT 1 FROM pg_policies
-    WHERE schemaname = 'realtime'
-      AND tablename  = 'messages'
-      AND policyname = 'hr_admin_can_receive_company_broadcasts'
+    WHERE schemaname = 'public'
+      AND tablename  = 'company_notifications'
+      AND policyname = 'hr_admin_select_own_company_notifications'
   ),
-  'T04: realtime.messages policy hr_admin_can_receive_company_broadcasts exists'
+  'T04: company_notifications policy hr_admin_select_own_company_notifications exists'
 );
 
 -- ── T05: HR can SELECT own profile ────────────────────────────────────────────

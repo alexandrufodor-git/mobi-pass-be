@@ -22,6 +22,7 @@ DO $$
 DECLARE
   v_co  UUID;
   v_uid UUID := gen_random_uuid();
+  v_dl  UUID;
   v_bk  UUID;
   v_bb  UUID;
 BEGIN
@@ -41,8 +42,11 @@ BEGIN
   INSERT INTO public.profiles (user_id, email, company_id, status, first_name, last_name)
   VALUES (v_uid, 'pgtap-00002@test.local', v_co, 'active', 'Test', 'User');
 
-  INSERT INTO public.bikes (name, full_price)
-  VALUES ('pgTAP Bike 00002', 1500.00)
+  INSERT INTO public.dealers (name) VALUES ('Test Dealer 00002')
+  RETURNING id INTO v_dl;
+
+  INSERT INTO public.bikes (name, full_price, dealer_id)
+  VALUES ('pgTAP Bike 00002', 1500.00, v_dl)
   RETURNING id INTO v_bk;
 
   -- Benefit: advance to pickup_delivery with all timestamps + bike set
@@ -93,7 +97,13 @@ BEGIN
 END;
 $$;
 
-SELECT plan(14);
+SELECT plan(17);
+
+-- ── T-pre: onboarding_status should be true after delivery (set in fixture) ──
+SELECT ok(
+  (SELECT onboarding_status FROM public.profiles WHERE user_id = (SELECT user_id FROM _fix02)),
+  'T-pre: onboarding_status = true after delivered_at was set'
+);
 
 -- ── Reset: step → choose_bike ────────────────────────────────
 UPDATE public.bike_benefits
@@ -179,6 +189,12 @@ SELECT is(
   'T11: reset deletes related contracts'
 );
 
+-- T-onb: onboarding_status reset to false on choose_bike
+SELECT ok(
+  NOT (SELECT onboarding_status FROM public.profiles WHERE user_id = (SELECT user_id FROM _fix02)),
+  'T-onb: reset to choose_bike sets onboarding_status = false'
+);
+
 -- ── Pricing at commit_to_bike ─────────────────────────────────
 -- Re-advance to commit_to_bike with bike set; trigger should compute prices.
 UPDATE public.bike_benefits
@@ -209,6 +225,24 @@ SELECT is(
   (SELECT employee_contract_months FROM public.bike_benefits WHERE id = (SELECT benefit_id FROM _fix02)),
   12,
   'T14: commit_to_bike stores employee_contract_months = 12'
+);
+
+-- ── Onboarding via delivery ─────────────────────────────────
+-- Re-advance to pickup_delivery with delivered_at to confirm onboarding triggers again
+UPDATE public.bike_benefits
+SET step       = 'sign_contract',
+    committed_at = now()
+WHERE id = (SELECT benefit_id FROM _fix02);
+
+UPDATE public.bike_benefits
+SET step         = 'pickup_delivery',
+    delivered_at = now()
+WHERE id = (SELECT benefit_id FROM _fix02);
+
+-- T15: onboarding_status = true after second delivery
+SELECT ok(
+  (SELECT onboarding_status FROM public.profiles WHERE user_id = (SELECT user_id FROM _fix02)),
+  'T15: onboarding_status = true after delivered_at set again'
 );
 
 SELECT * FROM finish();

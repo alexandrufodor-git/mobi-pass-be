@@ -426,19 +426,19 @@ DECLARE
   v_description text;
   v_department text;
   v_hire_date bigint;
+  v_webhook_secret text;
 BEGIN
-  -- Only proceed if user has confirmed their email (via OTP verification)
   IF NEW.email_confirmed_at IS NOT NULL THEN
 
     -- 1. Resolve company_id and employee fields from profile_invites
-    SELECT 
+    SELECT
       pi.company_id,
       pi.first_name,
       pi.last_name,
       pi.description,
       pi.department,
       pi.hire_date
-    INTO 
+    INTO
       v_company_id,
       v_first_name,
       v_last_name,
@@ -449,24 +449,15 @@ BEGIN
     WHERE LOWER(pi.email) = LOWER(NEW.email)
     LIMIT 1;
 
-    -- Optional but STRONGLY recommended safety check
     IF v_company_id IS NULL THEN
-      RAISE EXCEPTION
-        'No active invite found for email %',
-        NEW.email;
-      -- or: RETURN NEW;  -- if you want silent failure
+      RAISE EXCEPTION 'No active invite found for email %', NEW.email;
     END IF;
-    
-    -- 2. Automatically assign 'employee' role to new users
-    INSERT INTO public.user_roles (user_id, role)
-    VALUES (NEW.id, 'employee'::public.user_role)
-    ON CONFLICT (user_id, role) DO NOTHING;
-    
-    -- 3. Create or update profile with employee fields
+
+    -- 2. Create or update profile first (user_roles FK depends on this)
     INSERT INTO public.profiles (
-      user_id, 
-      email, 
-      status, 
+      user_id,
+      email,
+      status,
       company_id,
       first_name,
       last_name,
@@ -475,9 +466,9 @@ BEGIN
       hire_date
     )
     VALUES (
-      NEW.id, 
-      NEW.email, 
-      'active'::public.user_profile_status, 
+      NEW.id,
+      NEW.email,
+      'active'::public.user_profile_status,
       v_company_id,
       v_first_name,
       v_last_name,
@@ -485,29 +476,57 @@ BEGIN
       v_department,
       v_hire_date
     )
-    ON CONFLICT (user_id) 
-    DO UPDATE SET 
-      email = EXCLUDED.email,
-      status = 'active'::public.user_profile_status,
-      company_id = EXCLUDED.company_id,
-      first_name = EXCLUDED.first_name,
-      last_name = EXCLUDED.last_name,
+    ON CONFLICT (user_id)
+    DO UPDATE SET
+      email       = EXCLUDED.email,
+      status      = 'active'::public.user_profile_status,
+      company_id  = EXCLUDED.company_id,
+      first_name  = EXCLUDED.first_name,
+      last_name   = EXCLUDED.last_name,
       description = EXCLUDED.description,
-      department = EXCLUDED.department,
-      hire_date = EXCLUDED.hire_date;
-    
+      department  = EXCLUDED.department,
+      hire_date   = EXCLUDED.hire_date;
+
+    -- 3. Assign employee role (profile must already exist)
+    INSERT INTO public.user_roles (user_id, role)
+    VALUES (NEW.id, 'employee'::public.user_role)
+    ON CONFLICT (user_id, role) DO NOTHING;
+
     -- 4. Update profile_invites status to 'active'
     UPDATE public.profile_invites
     SET status = 'active'::public.user_profile_status
     WHERE LOWER(email) = LOWER(NEW.email);
-    
+
     -- 5. Create a bike benefit for the user
     INSERT INTO public.bike_benefits (user_id)
     VALUES (NEW.id)
     ON CONFLICT DO NOTHING;
-    
+
+    -- 6. Broadcast user_update to HR dashboard via notify-user-registration edge function
+    SELECT decrypted_secret INTO v_webhook_secret
+    FROM vault.decrypted_secrets
+    WHERE name = 'broadcast_webhook_secret'
+    LIMIT 1;
+
+    IF v_webhook_secret IS NOT NULL THEN
+      PERFORM net.http_post(
+        url     := 'https://xlfkdumbsflqxpezolhl.supabase.co/functions/v1/notify-user-registration',
+        headers := jsonb_build_object(
+          'Content-Type',     'application/json',
+          'x-webhook-secret', v_webhook_secret
+        ),
+        body    := jsonb_build_object(
+          'company_id',    v_company_id,
+          'user_id',       NEW.id,
+          'employee_name', v_first_name || ' ' || v_last_name
+        )
+      );
+    ELSE
+      RAISE WARNING '[handle_user_registration] Vault secret "broadcast_webhook_secret" not found — user_update broadcast skipped';
+    END IF;
+
   END IF;
-  
+
   RETURN NEW;
 END;
 $$;
@@ -575,6 +594,8 @@ BEGIN
       NEW.employee_contract_months    := NULL;
       DELETE FROM public.bike_orders WHERE bike_benefit_id = NEW.id;
       DELETE FROM public.contracts WHERE bike_benefit_id = NEW.id;
+      -- Reset onboarding status when going back to choose_bike
+      UPDATE public.profiles SET onboarding_status = false WHERE user_id = NEW.user_id;
     END IF;
     NEW.benefit_status := 'searching'::public.benefit_status;
 
@@ -611,6 +632,13 @@ BEGIN
 
   END IF;
 
+  -- Mark onboarding complete when delivered_at is set
+  IF TG_OP = 'UPDATE'
+     AND OLD.delivered_at IS NULL
+     AND NEW.delivered_at IS NOT NULL THEN
+    UPDATE public.profiles SET onboarding_status = true WHERE user_id = NEW.user_id;
+  END IF;
+
   RETURN NEW;
 END;
 $$;
@@ -623,7 +651,8 @@ COMMENT ON FUNCTION "public"."update_bike_benefit_status"() IS 'Auto-updates ben
 Terminal-state guard: once HR sets insurance_claim or terminated, any
 subsequent step/timestamp updates are ignored until HR explicitly changes it.
 choose_bike resets all downstream timestamps, contract_status, pricing,
-and deletes related bike_orders and contracts rows.';
+deletes related bike_orders and contracts rows, and resets onboarding_status.
+Sets onboarding_status = true when delivered_at transitions from NULL to non-NULL.';
 
 
 
@@ -829,21 +858,15 @@ CREATE TABLE IF NOT EXISTS "public"."bikes" (
     "wheel_bandwidth" "text",
     "lock_type" "text",
     "sku" "text",
-    "dealer_name" "text" DEFAULT 'Maros Bike'::"text",
-    "dealer_address" "text" DEFAULT 'Cluj Napoca str. Aurel Vlaicu Nr. 25'::"text",
-    "dealer_location_coords" "text" DEFAULT '23.62565635434891,46.780762423563985'::"text",
     "available_for_test" boolean DEFAULT true,
     "in_stock" boolean DEFAULT true,
     "type" "public"."bike_type",
-    "images" "jsonb"
+    "images" "jsonb",
+    "dealer_id" "uuid" NOT NULL
 );
 
 
 ALTER TABLE "public"."bikes" OWNER TO "postgres";
-
-
-COMMENT ON COLUMN "public"."bikes"."dealer_location_coords" IS 'Dealer location in "lon,lat" format for test rides and pickup';
-
 
 
 COMMENT ON COLUMN "public"."bikes"."type" IS 'Type/category of the bike (e.g., e-MTB, e-city, e-touring)';
@@ -885,6 +908,24 @@ COMMENT ON COLUMN "public"."companies"."esignatures_template_id" IS 'eSignatures
 
 
 
+CREATE TABLE IF NOT EXISTS "public"."dealers" (
+    "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,
+    "name" "text" NOT NULL,
+    "address" "text",
+    "location_coords" "text",
+    "phone" "text",
+    "created_at" timestamp with time zone DEFAULT "now"(),
+    "updated_at" timestamp with time zone DEFAULT "now"()
+);
+
+
+ALTER TABLE "public"."dealers" OWNER TO "postgres";
+
+
+COMMENT ON COLUMN "public"."dealers"."location_coords" IS 'Dealer location in "lon,lat" format for test rides and pickup';
+
+
+
 CREATE TABLE IF NOT EXISTS "public"."profiles" (
     "user_id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,
     "email" "text" NOT NULL,
@@ -896,7 +937,8 @@ CREATE TABLE IF NOT EXISTS "public"."profiles" (
     "description" "text",
     "department" "text",
     "hire_date" bigint,
-    "fcm_token" "text"
+    "fcm_token" "text",
+    "onboarding_status" boolean DEFAULT false
 );
 
 
@@ -945,9 +987,10 @@ CREATE OR REPLACE VIEW "public"."bikes_with_my_pricing" WITH ("security_invoker"
     "b"."wheel_bandwidth",
     "b"."lock_type",
     "b"."sku",
-    "b"."dealer_name",
-    "b"."dealer_address",
-    "b"."dealer_location_coords",
+    "d"."name" AS "dealer_name",
+    "d"."address" AS "dealer_address",
+    "d"."location_coords" AS "dealer_location_coords",
+    "d"."phone" AS "dealer_phone",
     "b"."available_for_test",
     "b"."in_stock",
     "b"."type",
@@ -958,7 +1001,8 @@ CREATE OR REPLACE VIEW "public"."bikes_with_my_pricing" WITH ("security_invoker"
     "c"."currency",
     "prices"."employee_price" AS "employee_full_price",
     "prices"."monthly_employee_price" AS "employee_monthly_price"
-   FROM ((("public"."bikes" "b"
+   FROM (((("public"."bikes" "b"
+     JOIN "public"."dealers" "d" ON (("d"."id" = "b"."dealer_id")))
      LEFT JOIN "public"."profiles" "me" ON (("me"."user_id" = "auth"."uid"())))
      LEFT JOIN "public"."companies" "c" ON (("c"."id" = "me"."company_id")))
      LEFT JOIN LATERAL "public"."calc_employee_prices"("b"."full_price", "c"."monthly_benefit_subsidy", "c"."contract_months") "prices"("employee_price", "monthly_employee_price") ON (true));
@@ -967,7 +1011,7 @@ CREATE OR REPLACE VIEW "public"."bikes_with_my_pricing" WITH ("security_invoker"
 ALTER VIEW "public"."bikes_with_my_pricing" OWNER TO "postgres";
 
 
-COMMENT ON VIEW "public"."bikes_with_my_pricing" IS 'Bike catalog with employee-specific pricing. Uses auth.uid() to resolve the calling user''s company subsidy and contract terms automatically. Returns all bikes; pricing columns are NULL when the user has no linked company. employee_full_price    = GREATEST(0, full_price - (contract_months x monthly_benefit_subsidy)). employee_monthly_price = employee_full_price / contract_months. employee_contract_month = companies.contract_months for the calling user''s company.';
+COMMENT ON VIEW "public"."bikes_with_my_pricing" IS 'Bike catalog with employee-specific pricing and dealer info. Uses auth.uid() to resolve the calling user''s company subsidy and contract terms automatically. Returns all bikes; pricing columns are NULL when the user has no linked company.';
 
 
 
@@ -1019,6 +1063,20 @@ COMMENT ON COLUMN "public"."contracts"."last_webhook_payload" IS 'Latest webhook
 
 
 COMMENT ON COLUMN "public"."contracts"."last_webhook_event" IS 'Event string from the latest webhook (e.g. signer-signed)';
+
+
+
+CREATE TABLE IF NOT EXISTS "public"."company_notifications" (
+    "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,
+    "company_id" "uuid" NOT NULL,
+    "event" "text" NOT NULL,
+    "event_type" "text" NOT NULL,
+    "payload" "jsonb" DEFAULT '{}'::"jsonb",
+    "created_at" timestamp with time zone DEFAULT "now"() NOT NULL
+);
+
+
+ALTER TABLE "public"."company_notifications" OWNER TO "postgres";
 
 
 
@@ -1174,6 +1232,11 @@ ALTER TABLE ONLY "public"."contracts"
 
 ALTER TABLE ONLY "public"."contracts"
     ADD CONSTRAINT "contracts_pkey" PRIMARY KEY ("id");
+
+
+
+ALTER TABLE ONLY "public"."dealers"
+    ADD CONSTRAINT "dealers_pkey" PRIMARY KEY ("id");
 
 
 
@@ -1342,6 +1405,11 @@ ALTER TABLE ONLY "public"."bike_orders"
 
 
 
+ALTER TABLE ONLY "public"."bikes"
+    ADD CONSTRAINT "bikes_dealer_id_fkey" FOREIGN KEY ("dealer_id") REFERENCES "public"."dealers"("id");
+
+
+
 ALTER TABLE ONLY "public"."contracts"
     ADD CONSTRAINT "contracts_bike_benefit_id_fkey" FOREIGN KEY ("bike_benefit_id") REFERENCES "public"."bike_benefits"("id") ON DELETE CASCADE;
 
@@ -1385,6 +1453,10 @@ CREATE POLICY "Authenticated users can read permissions" ON "public"."role_permi
 
 
 
+CREATE POLICY "Authenticated users can view dealers" ON "public"."dealers" FOR SELECT TO "authenticated" USING (true);
+
+
+
 CREATE POLICY "Enable read access for user own roles" ON "public"."user_roles" FOR SELECT USING (("auth"."uid"() = "user_id"));
 
 
@@ -1402,10 +1474,6 @@ CREATE POLICY "HR can update profile invites" ON "public"."profile_invites" FOR 
 
 
 CREATE POLICY "HR can view profile invites" ON "public"."profile_invites" FOR SELECT TO "authenticated" USING ((("auth"."jwt"() ->> 'user_role'::"text") = 'hr'::"text"));
-
-
-
-CREATE POLICY "HR can view profiles" ON "public"."profiles" FOR SELECT TO "authenticated" USING ((("auth"."jwt"() ->> 'user_role'::"text") = 'hr'::"text"));
 
 
 
@@ -1506,6 +1574,13 @@ CREATE POLICY "contracts_hr_admin_select" ON "public"."contracts" FOR SELECT TO 
 
 
 
+ALTER TABLE "public"."dealers" ENABLE ROW LEVEL SECURITY;
+
+
+CREATE POLICY "hr_select_own_company_profiles" ON "public"."profiles" FOR SELECT TO "authenticated" USING (((("auth"."jwt"() ->> 'user_role'::"text") = 'hr'::"text") AND ("company_id" = "public"."auth_company_id"())));
+
+
+
 ALTER TABLE "public"."profile_invites" ENABLE ROW LEVEL SECURITY;
 
 
@@ -1530,12 +1605,26 @@ ALTER TABLE "public"."role_permissions" ENABLE ROW LEVEL SECURITY;
 ALTER TABLE "public"."user_roles" ENABLE ROW LEVEL SECURITY;
 
 
+CREATE POLICY "user_roles_hr_select" ON "public"."user_roles" FOR SELECT TO "authenticated" USING (((("auth"."jwt"() ->> 'user_role'::"text") = 'hr'::"text") AND ("user_id" IN ( SELECT "p"."user_id"
+   FROM "public"."profiles" "p"
+  WHERE ("p"."company_id" = "public"."auth_company_id"())))));
+
+
+
 
 
 ALTER PUBLICATION "supabase_realtime" OWNER TO "postgres";
 
 
+
+
+
+
 ALTER PUBLICATION "supabase_realtime" ADD TABLE ONLY "public"."bike_benefits";
+
+
+
+ALTER PUBLICATION "supabase_realtime" ADD TABLE ONLY "public"."profiles";
 
 
 
@@ -1823,6 +1912,12 @@ GRANT ALL ON TABLE "public"."companies" TO "service_role";
 
 
 
+GRANT ALL ON TABLE "public"."dealers" TO "anon";
+GRANT ALL ON TABLE "public"."dealers" TO "authenticated";
+GRANT ALL ON TABLE "public"."dealers" TO "service_role";
+
+
+
 GRANT ALL ON TABLE "public"."profiles" TO "anon";
 GRANT ALL ON TABLE "public"."profiles" TO "authenticated";
 GRANT ALL ON TABLE "public"."profiles" TO "service_role";
@@ -1867,6 +1962,7 @@ GRANT ALL ON SEQUENCE "public"."role_permissions_id_seq" TO "service_role";
 
 GRANT ALL ON TABLE "public"."user_roles" TO "service_role";
 GRANT ALL ON TABLE "public"."user_roles" TO "supabase_auth_admin";
+GRANT SELECT ON TABLE "public"."user_roles" TO "authenticated";
 
 
 

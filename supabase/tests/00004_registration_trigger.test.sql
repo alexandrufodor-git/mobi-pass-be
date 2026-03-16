@@ -50,7 +50,7 @@ BEGIN
 END;
 $$;
 
-SELECT plan(7);
+SELECT plan(8);
 
 -- Manually fire the trigger by simulating what it does (trigger already ran on INSERT
 -- above but email_confirmed_at was NULL so steps were skipped).
@@ -139,6 +139,17 @@ SELECT ok(
     WHERE user_id = (SELECT user_id FROM _fix04)
   ),
   'T07: trigger idempotent — profile still exists after second update'
+);
+
+-- ── T08: company_notifications row created ────────────────────────────────────
+SELECT ok(
+  EXISTS(
+    SELECT 1 FROM public.company_notifications
+    WHERE company_id = (SELECT company_id FROM _fix04)
+      AND event = 'user_update'
+      AND event_type = 'created'
+  ),
+  'T08: company_notifications row inserted for user registration'
 );
 
 SELECT * FROM finish();

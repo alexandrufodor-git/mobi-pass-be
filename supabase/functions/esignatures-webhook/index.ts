@@ -3,7 +3,7 @@ import "jsr:@supabase/functions-js/edge-runtime.d.ts"
 import { ESIGNATURES_VAULT_KEY, EsigEvents, EsigToContractStatus, NotificationEvent, UserRoles } from "../_shared/constants.ts"
 import { makeRestClient, RestClient } from "../_shared/supabaseRest.ts"
 import { sendFcm } from "../_shared/fcm.ts"
-import { sendBroadcast } from "../_shared/broadcast.ts"
+import { sendNotification } from "../_shared/notifications.ts"
 
 // Deployed with verify_jwt: false — authentication is via HMAC-SHA256 signature.
 
@@ -79,17 +79,12 @@ async function sendWebhookNotifications(
         .catch((err) => console.error("[webhook] fcm error:", err))
     }
   } else if (role === UserRoles.EMPLOYEE && signer.company_id) {
-    // Employee acted → broadcast to HR dashboard only
-    sendBroadcast(
-      `notifications:${signer.company_id}`,
-      "contract_update",
-      {
-        user_id: contract.user_id,
-        employee_name: `${signer.first_name} ${signer.last_name}`.trim(),
-        event_type: EsigToContractStatus[event] ?? event,
-        contract_id: contract.id,
-      },
-    ).catch((err) => console.error("[webhook] broadcast error:", err))
+    // Employee acted → insert notification for HR dashboard
+    sendNotification(db, signer.company_id, "contract_update", EsigToContractStatus[event] ?? event, {
+      user_id: contract.user_id,
+      employee_name: `${signer.first_name} ${signer.last_name}`.trim(),
+      contract_id: contract.id,
+    }).catch((err) => console.error("[webhook] notification error:", err))
   }
 }
 

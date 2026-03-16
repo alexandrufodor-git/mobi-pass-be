@@ -26,7 +26,7 @@ Supabase backend for a company bike benefit platform. Employees select, test, an
 Roles are stored in `user_roles` (FK → `profiles.user_id`). A profile must exist before a role can be assigned. The registration trigger creates the profile first, then inserts the `employee` role. HR roles are assigned manually.
 
 ### Profile Fields
-`first_name`, `last_name`, `email`, `department`, `hire_date`, `description`, `company_id`
+`first_name`, `last_name`, `email`, `department`, `hire_date`, `description`, `company_id`, `onboarding_status`
 
 ### Bulk Invite
 - HR uploads a CSV to create employee invites.
@@ -34,8 +34,14 @@ Roles are stored in `user_roles` (FK → `profiles.user_id`). A profile must exi
 
 ---
 
+## Dealers
+- Dealer info is stored in a separate `dealers` table (`name`, `address`, `location_coords`, `phone`).
+- Each bike references a dealer via `dealer_id` (NOT NULL FK).
+- The `bikes_with_my_pricing` view JOINs `dealers` to expose `dealer_name`, `dealer_address`, `dealer_location_coords`, and `dealer_phone`.
+- RLS: all authenticated users can SELECT dealers (needed for test ride / pickup info).
+
 ## Bike Catalogue
-- Bikes have: name, brand, type, full price, images, specs, dealer info.
+- Bikes have: name, brand, type, full price, images, specs, `dealer_id` (FK → `dealers`).
 - Employee price is calculated from company subsidy: `full_price − (monthly_subsidy × contract_months)`.
 
 ---
@@ -45,7 +51,7 @@ Roles are stored in `user_roles` (FK → `profiles.user_id`). A profile must exi
 ### Steps
 `choose_bike` → `book_live_test` → `commit_to_bike` → `sign_contract` → `pickup_delivery`
 
-Resetting to `choose_bike` clears all subsequent timestamps and prices, and **deletes** all related `bike_orders` and `contracts` rows.
+Resetting to `choose_bike` clears all subsequent timestamps and prices, **deletes** all related `bike_orders` and `contracts` rows, and resets `profiles.onboarding_status` to `false`.
 
 ### Benefit Status (trigger-derived)
 | Status | Condition |
@@ -59,6 +65,11 @@ Resetting to `choose_bike` clears all subsequent timestamps and prices, and **de
 
 ### Pricing Snapshot
 `employee_full_price`, `employee_monthly_price`, `employee_contract_months` are calculated and locked at `commit_to_bike`. Cleared on reset to `choose_bike`.
+
+### Onboarding Status
+- `profiles.onboarding_status` (boolean, default `false`) tracks whether the employee has completed the bike benefit flow.
+- Set to `true` when `delivered_at` transitions from NULL to non-NULL (bike delivered).
+- Reset to `false` when the benefit is reset to `choose_bike`.
 
 ---
 
@@ -102,7 +113,7 @@ Each `send-contract` call creates a row in the `contracts` table storing the eSi
 - Guards: bike selected, pricing committed (`employee_full_price` set), no existing `contract_requested_at`.
 - Signers: employee (order 1) + HR of same company (order 2).
 - On success: sets `contract_requested_at`, advances `step` to `pickup_delivery`, returns `sign_page_url` to app.
-- Fires broadcast to `notifications:{company_id}` with `event_type: "created"` so HR dashboard is notified immediately.
+- Inserts into `company_notifications` with `event_type: "created"` so HR dashboard is notified immediately.
 - Currently calls eSignatures in **test mode** (`test: true` hardcoded).
 
 ### eSignatures Placeholder Fields
@@ -124,24 +135,23 @@ Each `send-contract` call creates a row in the `contracts` table storing the eSi
 | `contract_ready` | `send-contract` called | Employee | FCM |
 | `contract_signed_hr` | Webhook: HR signs | Employee | FCM |
 | `contract_approved` | Webhook: contract fully signed | Employee | FCM |
-| *(broadcast)* | `send-contract` called | HR dashboard | Supabase Realtime Broadcast |
-| *(broadcast)* | Webhook: Employee views/signs/declines | HR dashboard | Supabase Realtime Broadcast |
-| *(broadcast)* | User registration trigger | HR dashboard | Supabase Realtime Broadcast |
+| `contract_update` | `send-contract` called | HR dashboard | `company_notifications` + Realtime |
+| `contract_update` | Webhook: Employee views/signs/declines | HR dashboard | `company_notifications` + Realtime |
+| `user_update` | User registration trigger | HR dashboard | `company_notifications` + Realtime |
 
 ### FCM Data Payload
 All FCM messages include a `data` field with `event` (notification type for localization) and `bike_benefit_id` so the mobile client can reload the relevant bike benefit screen in real time. The `notification` field provides English fallback text only.
 
-### Realtime Broadcast (Web)
-- HR dashboard subscribes to `notifications:{company_id}` channel.
-- **`contract_update`** event: payload `{ user_id, employee_name, event_type, contract_id }`.
-  - `event_type` values: `"created"` (new contract sent), `"viewed_by_employee"`, `"signed_by_employee"`, `"declined_by_employee"` (mapped from eSignatures event strings via `EsigToContractStatus`).
-  - Sent by: `send-contract` (on creation) and `esignatures-webhook` (on employee action).
-- **`user_update`** event: payload `{ user_id, employee_name, event_type: "created" }`.
-  - Sent by: `handle_user_registration` trigger → calls `notify-user-registration` edge function via `pg_net`.
-- All broadcasts sent via Supabase Realtime REST API (`/realtime/v1/api/broadcast`).
-- `notify-user-registration` is an internal-only edge function (`verify_jwt: false`), protected by an `x-webhook-secret` header checked against the `BROADCAST_WEBHOOK_SECRET` env var. The service role key never leaves the edge function runtime.
-- Trigger reads `broadcast_webhook_secret` from Supabase Vault at runtime (scoped token — zero DB access if leaked). Project URL is hardcoded in the trigger (it's public).
-- **One-time setup**: add `broadcast_webhook_secret` to Vault, and set `BROADCAST_WEBHOOK_SECRET` edge function env var to the same value.
+### Realtime Notifications (Web)
+- Notifications are persisted in the `company_notifications` table. Realtime `postgres_changes` on that table pushes each INSERT to subscribed HR dashboard clients automatically — no manual broadcast call needed.
+- **`company_notifications` schema:** `id`, `company_id`, `event` (text), `event_type` (text), `payload` (jsonb), `created_at`.
+- **`contract_update`** event: payload `{ user_id, employee_name, contract_id }`.
+  - `event_type` values: `"created"` (new contract sent), `"viewed_by_employee"`, `"signed_by_employee"`, `"declined_by_employee"` (mapped via `EsigToContractStatus`).
+  - Inserted by: `send-contract` (on creation) and `esignatures-webhook` (on employee action).
+- **`user_update`** event: payload `{ user_id, employee_name }`, `event_type: "created"`.
+  - Inserted directly by `handle_user_registration` trigger (no edge function hop needed).
+- HR dashboard subscribes via `postgres_changes` filter `company_id=eq.{company_id}` and switches on `notification.event` / `notification.event_type`.
+- RLS policy `hr_admin_select_own_company_notifications`: only `hr` and `admin` roles can SELECT rows matching their own `company_id`.
 
 ### Signer Identification
 Webhook payload `data.signer.email` is matched against `profiles` + `user_roles` to determine role and route the notification accordingly.
@@ -156,7 +166,6 @@ Webhook payload `data.signer.email` is matched against `profiles` + `user_roles`
 | `bulk-create` | Web frontend | Yes | JWT + HR/Admin role |
 | `send-contract` | Mobile app | No | JWT (employee) |
 | `esignatures-webhook` | eSignatures.com | No | HMAC-SHA256 |
-| `notify-user-registration` | DB trigger (pg_net) | No | Shared secret (`x-webhook-secret`) |
 
 ---
 
@@ -179,5 +188,3 @@ Webhook payload `data.signer.email` is matched against `profiles` + `user_roles`
 | `firebase_project_id` | Supabase Vault | `send-contract`, `esignatures-webhook` (FCM) |
 | `ALLOWED_ORIGINS` | Supabase secrets | `bulk-create` |
 | `esignatures_template_id` | `companies` table | `send-contract` |
-| `broadcast_webhook_secret` | Supabase Vault + edge function env var | `notify-user-registration` (trigger auth) |
-| `BROADCAST_WEBHOOK_SECRET` | Supabase edge function secrets | `notify-user-registration` |

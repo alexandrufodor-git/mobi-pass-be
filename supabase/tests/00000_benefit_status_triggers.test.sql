@@ -21,6 +21,7 @@ DO $$
 DECLARE
   v_co  UUID;
   v_uid UUID := gen_random_uuid();
+  v_dl  UUID;
   v_bk  UUID;
   v_bb  UUID;
   v_bb2 UUID;
@@ -41,8 +42,11 @@ BEGIN
   INSERT INTO public.profiles (user_id, email, company_id, status, first_name, last_name)
   VALUES (v_uid, 'pgtap-00000@test.local', v_co, 'active', 'Test', 'User');
 
-  INSERT INTO public.bikes (name, full_price)
-  VALUES ('pgTAP Bike 00000', 1500.00)
+  INSERT INTO public.dealers (name) VALUES ('Test Dealer 00000')
+  RETURNING id INTO v_dl;
+
+  INSERT INTO public.bikes (name, full_price, dealer_id)
+  VALUES ('pgTAP Bike 00000', 1500.00, v_dl)
   RETURNING id INTO v_bk;
 
   -- Primary benefit (step=NULL → inactive)
