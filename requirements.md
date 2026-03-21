@@ -179,6 +179,49 @@ Webhook payload `data.signer.email` is matched against `profiles` + `user_roles`
 
 ---
 
+## Image Upload
+
+### Storage Buckets
+| Bucket | Public | Max size | MIME types |
+|--------|--------|----------|------------|
+| `avatars` | Yes | 2 MB | jpeg, png, webp |
+| `company-logos` | Yes | 2 MB | jpeg, png, webp, svg+xml |
+
+### Path Convention
+- Avatar: `{user_id}` — one file per user, overwrites on re-upload.
+- Company logo: `{company_id}` — one file per company, overwrites on re-upload.
+
+### DB Columns
+- `profiles.profile_image_path` — storage path of the employee's avatar.
+- `companies.logo_image_path` — storage path of the company logo.
+
+Both columns are exposed in `profile_invites_with_details`.
+
+### RLS
+- **avatars**: any authenticated user can upload/replace/delete their own avatar (`name = auth.uid()`).
+- **company-logos**: `hr` or `admin` can upload/replace/delete their company's logo (`name = auth_company_id()`).
+- Both buckets are public for SELECT (no auth required to display images in the app).
+
+### Client Usage (Supabase JS)
+```ts
+// Upload avatar
+const { data, error } = await supabase.storage
+  .from('avatars')
+  .upload(userId, file, { upsert: true });
+
+// Upload company logo (HR/admin)
+const { data, error } = await supabase.storage
+  .from('company-logos')
+  .upload(companyId, file, { upsert: true });
+
+// Get public URL
+const { data: { publicUrl } } = supabase.storage
+  .from('avatars')
+  .getPublicUrl(userId);
+```
+
+---
+
 ## Configuration
 
 | Key | Where | Used by |

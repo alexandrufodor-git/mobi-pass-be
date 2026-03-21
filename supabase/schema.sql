@@ -420,13 +420,12 @@ CREATE OR REPLACE FUNCTION "public"."handle_user_registration"() RETURNS "trigge
     LANGUAGE "plpgsql" SECURITY DEFINER
     AS $$
 DECLARE
-  v_company_id uuid;
-  v_first_name text;
-  v_last_name text;
+  v_company_id  uuid;
+  v_first_name  text;
+  v_last_name   text;
   v_description text;
-  v_department text;
-  v_hire_date bigint;
-  v_webhook_secret text;
+  v_department  text;
+  v_hire_date   bigint;
 BEGIN
   IF NEW.email_confirmed_at IS NOT NULL THEN
 
@@ -453,31 +452,16 @@ BEGIN
       RAISE EXCEPTION 'No active invite found for email %', NEW.email;
     END IF;
 
-    -- 2. Create or update profile first (user_roles FK depends on this)
+    -- 2. Create or update profile (must exist before user_roles FK insert)
     INSERT INTO public.profiles (
-      user_id,
-      email,
-      status,
-      company_id,
-      first_name,
-      last_name,
-      description,
-      department,
-      hire_date
+      user_id, email, status, company_id,
+      first_name, last_name, description, department, hire_date
     )
     VALUES (
-      NEW.id,
-      NEW.email,
-      'active'::public.user_profile_status,
-      v_company_id,
-      v_first_name,
-      v_last_name,
-      v_description,
-      v_department,
-      v_hire_date
+      NEW.id, NEW.email, 'active'::public.user_profile_status, v_company_id,
+      v_first_name, v_last_name, v_description, v_department, v_hire_date
     )
-    ON CONFLICT (user_id)
-    DO UPDATE SET
+    ON CONFLICT (user_id) DO UPDATE SET
       email       = EXCLUDED.email,
       status      = 'active'::public.user_profile_status,
       company_id  = EXCLUDED.company_id,
@@ -487,43 +471,32 @@ BEGIN
       department  = EXCLUDED.department,
       hire_date   = EXCLUDED.hire_date;
 
-    -- 3. Assign employee role (profile must already exist)
+    -- 3. Assign 'employee' role
     INSERT INTO public.user_roles (user_id, role)
     VALUES (NEW.id, 'employee'::public.user_role)
     ON CONFLICT (user_id, role) DO NOTHING;
 
-    -- 4. Update profile_invites status to 'active'
+    -- 4. Update profile_invites status
     UPDATE public.profile_invites
     SET status = 'active'::public.user_profile_status
     WHERE LOWER(email) = LOWER(NEW.email);
 
-    -- 5. Create a bike benefit for the user
+    -- 5. Create bike benefit
     INSERT INTO public.bike_benefits (user_id)
     VALUES (NEW.id)
     ON CONFLICT DO NOTHING;
 
-    -- 6. Broadcast user_update to HR dashboard via notify-user-registration edge function
-    SELECT decrypted_secret INTO v_webhook_secret
-    FROM vault.decrypted_secrets
-    WHERE name = 'broadcast_webhook_secret'
-    LIMIT 1;
-
-    IF v_webhook_secret IS NOT NULL THEN
-      PERFORM net.http_post(
-        url     := 'https://xlfkdumbsflqxpezolhl.supabase.co/functions/v1/notify-user-registration',
-        headers := jsonb_build_object(
-          'Content-Type',     'application/json',
-          'x-webhook-secret', v_webhook_secret
-        ),
-        body    := jsonb_build_object(
-          'company_id',    v_company_id,
-          'user_id',       NEW.id,
-          'employee_name', v_first_name || ' ' || v_last_name
-        )
-      );
-    ELSE
-      RAISE WARNING '[handle_user_registration] Vault secret "broadcast_webhook_secret" not found — user_update broadcast skipped';
-    END IF;
+    -- 6. Insert notification — Realtime postgres_changes delivers it to HR dashboard
+    INSERT INTO public.company_notifications (company_id, event, event_type, payload)
+    VALUES (
+      v_company_id,
+      'user_update',
+      'created',
+      jsonb_build_object(
+        'user_id',       NEW.id,
+        'employee_name', v_first_name || ' ' || v_last_name
+      )
+    );
 
   END IF;
 
@@ -533,6 +506,23 @@ $$;
 
 
 ALTER FUNCTION "public"."handle_user_registration"() OWNER TO "postgres";
+
+
+CREATE OR REPLACE FUNCTION "public"."sync_avatar_to_profile"() RETURNS "trigger"
+    LANGUAGE "plpgsql" SECURITY DEFINER
+    AS $$
+BEGIN
+  IF NEW.bucket_id = 'avatars' THEN
+    UPDATE public.profiles
+    SET profile_image_path = NEW.name
+    WHERE user_id = NEW.name::uuid;
+  END IF;
+  RETURN NEW;
+END;
+$$;
+
+
+ALTER FUNCTION "public"."sync_avatar_to_profile"() OWNER TO "postgres";
 
 
 CREATE OR REPLACE FUNCTION "public"."sync_profile_email"() RETURNS "trigger"
@@ -881,7 +871,8 @@ CREATE TABLE IF NOT EXISTS "public"."companies" (
     "monthly_benefit_subsidy" numeric(10,2) DEFAULT 72.00,
     "contract_months" integer DEFAULT 36,
     "currency" "public"."currency_type" DEFAULT 'RON'::"public"."currency_type" NOT NULL,
-    "esignatures_template_id" "text"
+    "esignatures_template_id" "text",
+    "logo_image_path" "text"
 );
 
 
@@ -938,7 +929,8 @@ CREATE TABLE IF NOT EXISTS "public"."profiles" (
     "department" "text",
     "hire_date" bigint,
     "fcm_token" "text",
-    "onboarding_status" boolean DEFAULT false
+    "onboarding_status" boolean DEFAULT false,
+    "profile_image_path" "text"
 );
 
 
@@ -1015,6 +1007,19 @@ COMMENT ON VIEW "public"."bikes_with_my_pricing" IS 'Bike catalog with employee-
 
 
 
+CREATE TABLE IF NOT EXISTS "public"."company_notifications" (
+    "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,
+    "company_id" "uuid" NOT NULL,
+    "event" "text" NOT NULL,
+    "event_type" "text" NOT NULL,
+    "payload" "jsonb" DEFAULT '{}'::"jsonb",
+    "created_at" timestamp with time zone DEFAULT "now"() NOT NULL
+);
+
+
+ALTER TABLE "public"."company_notifications" OWNER TO "postgres";
+
+
 CREATE TABLE IF NOT EXISTS "public"."contracts" (
     "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,
     "bike_benefit_id" "uuid" NOT NULL,
@@ -1063,20 +1068,6 @@ COMMENT ON COLUMN "public"."contracts"."last_webhook_payload" IS 'Latest webhook
 
 
 COMMENT ON COLUMN "public"."contracts"."last_webhook_event" IS 'Event string from the latest webhook (e.g. signer-signed)';
-
-
-
-CREATE TABLE IF NOT EXISTS "public"."company_notifications" (
-    "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,
-    "company_id" "uuid" NOT NULL,
-    "event" "text" NOT NULL,
-    "event_type" "text" NOT NULL,
-    "payload" "jsonb" DEFAULT '{}'::"jsonb",
-    "created_at" timestamp with time zone DEFAULT "now"() NOT NULL
-);
-
-
-ALTER TABLE "public"."company_notifications" OWNER TO "postgres";
 
 
 
@@ -1129,9 +1120,11 @@ CREATE OR REPLACE VIEW "public"."profile_invites_with_details" WITH ("security_i
     "pi"."created_at" AS "invited_at",
     "pi"."company_id",
     "c"."name" AS "company_name",
+    "c"."logo_image_path",
     "p"."user_id",
     "p"."status" AS "profile_status",
     "p"."created_at" AS "registered_at",
+    "p"."profile_image_path",
     COALESCE("p"."first_name", "pi"."first_name") AS "first_name",
     COALESCE("p"."last_name", "pi"."last_name") AS "last_name",
     COALESCE("p"."description", "pi"."description") AS "description",
@@ -1222,6 +1215,11 @@ ALTER TABLE ONLY "public"."bikes"
 
 ALTER TABLE ONLY "public"."companies"
     ADD CONSTRAINT "companies_pkey" PRIMARY KEY ("id");
+
+
+
+ALTER TABLE ONLY "public"."company_notifications"
+    ADD CONSTRAINT "company_notifications_pkey" PRIMARY KEY ("id");
 
 
 
@@ -1317,6 +1315,14 @@ CREATE INDEX "idx_bikes_type" ON "public"."bikes" USING "btree" ("type");
 
 
 
+CREATE INDEX "idx_company_notifications_company_id" ON "public"."company_notifications" USING "btree" ("company_id");
+
+
+
+CREATE INDEX "idx_company_notifications_created_at" ON "public"."company_notifications" USING "btree" ("created_at" DESC);
+
+
+
 CREATE INDEX "idx_contracts_bike_benefit_id" ON "public"."contracts" USING "btree" ("bike_benefit_id");
 
 
@@ -1407,6 +1413,11 @@ ALTER TABLE ONLY "public"."bike_orders"
 
 ALTER TABLE ONLY "public"."bikes"
     ADD CONSTRAINT "bikes_dealer_id_fkey" FOREIGN KEY ("dealer_id") REFERENCES "public"."dealers"("id");
+
+
+
+ALTER TABLE ONLY "public"."company_notifications"
+    ADD CONSTRAINT "company_notifications_company_id_fkey" FOREIGN KEY ("company_id") REFERENCES "public"."companies"("id") ON DELETE CASCADE;
 
 
 
@@ -1561,6 +1572,9 @@ CREATE POLICY "companies_hr_update" ON "public"."companies" FOR UPDATE TO "authe
 
 
 
+ALTER TABLE "public"."company_notifications" ENABLE ROW LEVEL SECURITY;
+
+
 ALTER TABLE "public"."contracts" ENABLE ROW LEVEL SECURITY;
 
 
@@ -1575,6 +1589,10 @@ CREATE POLICY "contracts_hr_admin_select" ON "public"."contracts" FOR SELECT TO 
 
 
 ALTER TABLE "public"."dealers" ENABLE ROW LEVEL SECURITY;
+
+
+CREATE POLICY "hr_admin_select_own_company_notifications" ON "public"."company_notifications" FOR SELECT TO "authenticated" USING ((("company_id" = "public"."auth_company_id"()) AND (("auth"."jwt"() ->> 'user_role'::"text") = ANY (ARRAY['hr'::"text", 'admin'::"text"]))));
+
 
 
 CREATE POLICY "hr_select_own_company_profiles" ON "public"."profiles" FOR SELECT TO "authenticated" USING (((("auth"."jwt"() ->> 'user_role'::"text") = 'hr'::"text") AND ("company_id" = "public"."auth_company_id"())));
@@ -1621,6 +1639,10 @@ ALTER PUBLICATION "supabase_realtime" OWNER TO "postgres";
 
 
 ALTER PUBLICATION "supabase_realtime" ADD TABLE ONLY "public"."bike_benefits";
+
+
+
+ALTER PUBLICATION "supabase_realtime" ADD TABLE ONLY "public"."company_notifications";
 
 
 
@@ -1849,6 +1871,12 @@ GRANT ALL ON FUNCTION "public"."handle_user_registration"() TO "service_role";
 
 
 
+GRANT ALL ON FUNCTION "public"."sync_avatar_to_profile"() TO "anon";
+GRANT ALL ON FUNCTION "public"."sync_avatar_to_profile"() TO "authenticated";
+GRANT ALL ON FUNCTION "public"."sync_avatar_to_profile"() TO "service_role";
+
+
+
 GRANT ALL ON FUNCTION "public"."sync_profile_email"() TO "anon";
 GRANT ALL ON FUNCTION "public"."sync_profile_email"() TO "authenticated";
 GRANT ALL ON FUNCTION "public"."sync_profile_email"() TO "service_role";
@@ -1927,6 +1955,12 @@ GRANT ALL ON TABLE "public"."profiles" TO "service_role";
 GRANT ALL ON TABLE "public"."bikes_with_my_pricing" TO "anon";
 GRANT ALL ON TABLE "public"."bikes_with_my_pricing" TO "authenticated";
 GRANT ALL ON TABLE "public"."bikes_with_my_pricing" TO "service_role";
+
+
+
+GRANT ALL ON TABLE "public"."company_notifications" TO "anon";
+GRANT ALL ON TABLE "public"."company_notifications" TO "authenticated";
+GRANT ALL ON TABLE "public"."company_notifications" TO "service_role";
 
 
 
