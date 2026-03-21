@@ -192,33 +192,24 @@ Webhook payload `data.signer.email` is matched against `profiles` + `user_roles`
 - Company logo: `{company_id}` — one file per company, overwrites on re-upload.
 
 ### DB Columns
-- `profiles.profile_image_path` — storage path of the employee's avatar.
-- `companies.logo_image_path` — storage path of the company logo.
+- `profiles.profile_image_path` — storage object name (e.g. `3b155d9b-...`). **Not a full URL.**
+- `companies.logo_image_path` — storage object name (e.g. `23628f81-...png`). **Not a full URL.**
 
-Both columns are exposed in `profile_invites_with_details`.
+Both columns are exposed in `profile_invites_with_details`. Clients construct the full public URL:
+```
+GET {BASE_URL}/storage/v1/object/public/avatars/{profile_image_path}
+GET {BASE_URL}/storage/v1/object/public/company-logos/{logo_image_path}
+```
+
+### Auto-Sync Trigger
+A trigger `on_avatar_upload` on `storage.objects` automatically sets `profiles.profile_image_path = name` when a file is uploaded to the `avatars` bucket. Employees only need to upload — no separate profile update required.
+
+Company logos are uploaded manually by HR/admin; they must update `companies.logo_image_path` separately.
 
 ### RLS
 - **avatars**: any authenticated user can upload/replace/delete their own avatar (`name = auth.uid()`).
 - **company-logos**: `hr` or `admin` can upload/replace/delete their company's logo (`name = auth_company_id()`).
-- Both buckets are public for SELECT (no auth required to display images in the app).
-
-### Client Usage (Supabase JS)
-```ts
-// Upload avatar
-const { data, error } = await supabase.storage
-  .from('avatars')
-  .upload(userId, file, { upsert: true });
-
-// Upload company logo (HR/admin)
-const { data, error } = await supabase.storage
-  .from('company-logos')
-  .upload(companyId, file, { upsert: true });
-
-// Get public URL
-const { data: { publicUrl } } = supabase.storage
-  .from('avatars')
-  .getPublicUrl(userId);
-```
+- Both buckets are public for SELECT (no auth required to display images).
 
 ---
 
