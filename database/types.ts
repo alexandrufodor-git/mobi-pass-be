@@ -65,7 +65,8 @@ export interface BikeBenefit {
   
   // Live test details
   live_test_location: string | null;
-  live_test_location_coords: string | null;
+  live_test_lat: number | null;
+  live_test_lon: number | null;
   live_test_location_name: string | null;
   live_test_whatsapp_sent_at: string | null;
   live_test_checked_in_at: string | null;
@@ -123,7 +124,8 @@ export interface Bike {
   // Dealer info
   dealer_name: string | null;
   dealer_address: string | null;
-  dealer_location_coords: string | null;
+  dealer_lat: number | null;
+  dealer_lon: number | null;
   
   // Availability
   available_for_test: boolean;
@@ -151,6 +153,7 @@ export interface Company {
   name: string;
   monthly_benefit_subsidy: number;
   contract_months: number;
+  days_in_office: number;
   created_at: string;
   updated_at: string;
 }
@@ -216,7 +219,8 @@ export interface ProfileInviteWithDetails {
   contract_terminated_at: string | null;
   
   // Test location
-  live_test_location_coords: string | null;
+  live_test_lat: number | null;
+  live_test_lon: number | null;
   live_test_location_name: string | null;
   live_test_whatsapp_sent_at: string | null;
   live_test_checked_in_at: string | null;

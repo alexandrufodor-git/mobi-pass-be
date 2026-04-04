@@ -721,7 +721,8 @@ CREATE TABLE IF NOT EXISTS "public"."bike_benefits" (
     "delivered_at" timestamp with time zone,
     "created_at" timestamp with time zone DEFAULT "now"() NOT NULL,
     "updated_at" timestamp with time zone DEFAULT "now"() NOT NULL,
-    "live_test_location_coords" "text",
+    "live_test_lat" double precision,
+    "live_test_lon" double precision,
     "live_test_location_name" "text",
     "benefit_status" "public"."benefit_status",
     "contract_status" "public"."contract_status",
@@ -744,7 +745,10 @@ CREATE TABLE IF NOT EXISTS "public"."bike_benefits" (
 ALTER TABLE "public"."bike_benefits" OWNER TO "postgres";
 
 
-COMMENT ON COLUMN "public"."bike_benefits"."live_test_location_coords" IS 'Location coordinates in "lon,lat" format (e.g., "23.5880556,46.7712101")';
+COMMENT ON COLUMN "public"."bike_benefits"."live_test_lat" IS 'Latitude of the test ride location';
+
+
+COMMENT ON COLUMN "public"."bike_benefits"."live_test_lon" IS 'Longitude of the test ride location';
 
 
 
@@ -872,7 +876,12 @@ CREATE TABLE IF NOT EXISTS "public"."companies" (
     "contract_months" integer DEFAULT 36,
     "currency" "public"."currency_type" DEFAULT 'RON'::"public"."currency_type" NOT NULL,
     "esignatures_template_id" "text",
-    "logo_image_path" "text"
+    "logo_image_path" "text",
+    "address" "text",
+    "address_lat" double precision,
+    "address_lon" double precision,
+    "contact_email" "text",
+    "days_in_office" integer DEFAULT 5
 );
 
 
@@ -903,7 +912,8 @@ CREATE TABLE IF NOT EXISTS "public"."dealers" (
     "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,
     "name" "text" NOT NULL,
     "address" "text",
-    "location_coords" "text",
+    "lat" double precision,
+    "lon" double precision,
     "phone" "text",
     "created_at" timestamp with time zone DEFAULT "now"(),
     "updated_at" timestamp with time zone DEFAULT "now"()
@@ -911,9 +921,6 @@ CREATE TABLE IF NOT EXISTS "public"."dealers" (
 
 
 ALTER TABLE "public"."dealers" OWNER TO "postgres";
-
-
-COMMENT ON COLUMN "public"."dealers"."location_coords" IS 'Dealer location in "lon,lat" format for test rides and pickup';
 
 
 
@@ -930,7 +937,10 @@ CREATE TABLE IF NOT EXISTS "public"."profiles" (
     "hire_date" bigint,
     "fcm_token" "text",
     "onboarding_status" boolean DEFAULT false,
-    "profile_image_path" "text"
+    "profile_image_path" "text",
+    "home_address" "text",
+    "home_lat" double precision,
+    "home_lon" double precision
 );
 
 
@@ -981,7 +991,8 @@ CREATE OR REPLACE VIEW "public"."bikes_with_my_pricing" WITH ("security_invoker"
     "b"."sku",
     "d"."name" AS "dealer_name",
     "d"."address" AS "dealer_address",
-    "d"."location_coords" AS "dealer_location_coords",
+    "d"."lat" AS "dealer_lat",
+    "d"."lon" AS "dealer_lon",
     "d"."phone" AS "dealer_phone",
     "b"."available_for_test",
     "b"."in_stock",
