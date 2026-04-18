@@ -3,16 +3,18 @@ SET search_path TO extensions, public;
 -- ============================================================
 -- pgTAP: Location columns + contact_email
 -- Tests:
---  T01: Employee can read own home address fields
---  T02: Employee can update own home address fields
---  T03: Employee can read company address + contact_email
---  T04: HR can update company address + contact_email
---  T05: Employee cannot update company fields
---  T06: Dealers have lat/lon (not location_coords)
---  T07: bikes_with_my_pricing exposes dealer_lat and dealer_lon
---  T08: bike_benefits has live_test_lat/lon columns
---  T09: Company has days_in_office with default value 5
---  T10: HR can update days_in_office
+--  T01: Employee can read company address + contact_email
+--  T02: HR can update company address + contact_email
+--  T03: Employee cannot update company fields
+--  T04: Dealers have lat/lon (not location_coords)
+--  T05: bikes_with_my_pricing exposes dealer_lat and dealer_lon
+--  T06: bike_benefits has live_test_lat/lon columns
+--  T07: Company has days_in_office with default value 5
+--  T08: HR can update days_in_office
+--
+-- NOTE: T01/T02 from the original version (employee home address on profiles)
+-- were removed — home_address/home_lat/home_lon moved to employee_pii table.
+-- See 00010_employee_pii.test.sql for those tests.
 -- ============================================================
 
 BEGIN;
@@ -64,59 +66,9 @@ BEGIN
 END;
 $$;
 
-SELECT plan(10);
+SELECT plan(8);
 
--- ── T01: Employee can read own home address fields ───────────────────────────
-SET LOCAL ROLE authenticated;
-SELECT set_config('request.jwt.claims',
-  json_build_object('sub', current_setting('test.emp_id'), 'role', 'authenticated', 'user_role', 'employee')::text,
-  true);
-
--- First set some home data (via self-update)
-UPDATE public.profiles
-SET home_address = 'Str. Acasa Nr. 10, Cluj-Napoca',
-    home_lat = 46.770439,
-    home_lon = 23.591423
-WHERE user_id = current_setting('test.emp_id')::uuid;
-
-SELECT ok(
-  EXISTS(
-    SELECT 1 FROM public.profiles
-    WHERE user_id = current_setting('test.emp_id')::uuid
-      AND home_address = 'Str. Acasa Nr. 10, Cluj-Napoca'
-      AND home_lat = 46.770439
-      AND home_lon = 23.591423
-  ),
-  'T01: employee can read own home address fields'
-);
-
-RESET ROLE;
-
--- ── T02: Employee can update own home address fields ─────────────────────────
-SET LOCAL ROLE authenticated;
-SELECT set_config('request.jwt.claims',
-  json_build_object('sub', current_setting('test.emp_id'), 'role', 'authenticated', 'user_role', 'employee')::text,
-  true);
-
-UPDATE public.profiles
-SET home_address = 'Str. Noua Nr. 5',
-    home_lat = 46.780000,
-    home_lon = 23.600000
-WHERE user_id = current_setting('test.emp_id')::uuid;
-
-SELECT ok(
-  EXISTS(
-    SELECT 1 FROM public.profiles
-    WHERE user_id = current_setting('test.emp_id')::uuid
-      AND home_address = 'Str. Noua Nr. 5'
-      AND home_lat = 46.780000
-  ),
-  'T02: employee can update own home address fields'
-);
-
-RESET ROLE;
-
--- ── T03: Employee can read company address + contact_email ───────────────────
+-- ── T01: Employee can read company address + contact_email ───────────────────
 -- Seed company address as postgres first
 UPDATE public.companies
 SET address = 'Blvd 21 Dec. 180, Cluj-Napoca',
@@ -138,12 +90,12 @@ SELECT ok(
       AND address_lat = 46.773
       AND contact_email = 'hr@8x8.com'
   ),
-  'T03: employee can read company address and contact_email'
+  'T01: employee can read company address and contact_email'
 );
 
 RESET ROLE;
 
--- ── T04: HR can update company address + contact_email ───────────────────────
+-- ── T02: HR can update company address + contact_email ───────────────────────
 SET LOCAL ROLE authenticated;
 SELECT set_config('request.jwt.claims',
   json_build_object('sub', current_setting('test.hr_id'), 'role', 'authenticated', 'user_role', 'hr')::text,
@@ -163,12 +115,12 @@ SELECT ok(
       AND address = 'Str. Updated Nr. 99'
       AND contact_email = 'new-hr@8x8.com'
   ),
-  'T04: HR can update company address and contact_email'
+  'T02: HR can update company address and contact_email'
 );
 
 RESET ROLE;
 
--- ── T05: Employee cannot update company fields ───────────────────────────────
+-- ── T03: Employee cannot update company fields ───────────────────────────────
 SET LOCAL ROLE authenticated;
 SELECT set_config('request.jwt.claims',
   json_build_object('sub', current_setting('test.emp_id'), 'role', 'authenticated', 'user_role', 'employee')::text,
@@ -184,12 +136,12 @@ SELECT ok(
     WHERE id = current_setting('test.co_id')::uuid
       AND contact_email = 'new-hr@8x8.com'
   ),
-  'T05: employee cannot update company contact_email'
+  'T03: employee cannot update company contact_email'
 );
 
 RESET ROLE;
 
--- ── T06: Dealers have lat/lon columns ────────────────────────────────────────
+-- ── T04: Dealers have lat/lon columns ────────────────────────────────────────
 SELECT ok(
   EXISTS(
     SELECT 1 FROM public.dealers
@@ -197,10 +149,10 @@ SELECT ok(
       AND lat = 46.7712101
       AND lon = 23.5880556
   ),
-  'T06: dealer has lat/lon double precision columns'
+  'T04: dealer has lat/lon double precision columns'
 );
 
--- ── T07: bikes_with_my_pricing exposes dealer_lat and dealer_lon ─────────────
+-- ── T05: bikes_with_my_pricing exposes dealer_lat and dealer_lon ─────────────
 SET LOCAL ROLE authenticated;
 SELECT set_config('request.jwt.claims',
   json_build_object('sub', current_setting('test.emp_id'), 'role', 'authenticated', 'user_role', 'employee')::text,
@@ -212,12 +164,12 @@ SELECT ok(
     WHERE dealer_lat = 46.7712101
       AND dealer_lon = 23.5880556
   ),
-  'T07: bikes_with_my_pricing exposes dealer_lat and dealer_lon'
+  'T05: bikes_with_my_pricing exposes dealer_lat and dealer_lon'
 );
 
 RESET ROLE;
 
--- ── T08: bike_benefits has live_test_lat/lon ─────────────────────────────────
+-- ── T06: bike_benefits has live_test_lat/lon ─────────────────────────────────
 SELECT ok(
   EXISTS(
     SELECT 1 FROM public.bike_benefits
@@ -225,20 +177,20 @@ SELECT ok(
       AND live_test_lat = 46.7712101
       AND live_test_lon = 23.5880556
   ),
-  'T08: bike_benefits has live_test_lat/lon columns'
+  'T06: bike_benefits has live_test_lat/lon columns'
 );
 
--- ── T09: Company has days_in_office with default 5 ───────────────────────────
+-- ── T07: Company has days_in_office with default 5 ───────────────────────────
 SELECT ok(
   EXISTS(
     SELECT 1 FROM public.companies
     WHERE id = current_setting('test.co_id')::uuid
       AND days_in_office = 5
   ),
-  'T09: company days_in_office defaults to 5'
+  'T07: company days_in_office defaults to 5'
 );
 
--- ── T10: HR can update days_in_office ────────────────────────────────────────
+-- ── T08: HR can update days_in_office ────────────────────────────────────────
 SET LOCAL ROLE authenticated;
 SELECT set_config('request.jwt.claims',
   json_build_object('sub', current_setting('test.hr_id'), 'role', 'authenticated', 'user_role', 'hr')::text,
@@ -254,7 +206,7 @@ SELECT ok(
     WHERE id = current_setting('test.co_id')::uuid
       AND days_in_office = 3
   ),
-  'T10: HR can update days_in_office'
+  'T08: HR can update days_in_office'
 );
 
 RESET ROLE;

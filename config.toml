@@ -386,7 +386,7 @@ s3_secret_key = "env(S3_SECRET_KEY)"
 
 [functions.bulk-create]
 enabled = true
-verify_jwt = false
+verify_jwt = true
 import_map = "./functions/bulk-create/deno.json"
 # Uncomment to specify a custom file path to the entrypoint.
 # Supported file extensions are: .ts, .js, .mjs, .jsx, .tsx
@@ -406,3 +406,52 @@ entrypoint = "./functions/register/index.ts"
 # Specifies static files to be bundled with the function. Supports glob patterns.
 # For example, if you want to serve static HTML pages in your function:
 # static_files = [ "./functions/register/*.html" ]
+
+[functions.get-employee-details]
+enabled = true
+verify_jwt = true
+import_map = "./functions/get-employee-details/deno.json"
+entrypoint = "./functions/get-employee-details/index.ts"
+
+[functions.tbi-loan-request]
+enabled = true
+verify_jwt = true
+import_map = "./functions/tbi-loan-request/deno.json"
+entrypoint = "./functions/tbi-loan-request/index.ts"
+
+[functions.tbi-webhook]
+enabled = true
+verify_jwt = false
+import_map = "./functions/tbi-webhook/deno.json"
+entrypoint = "./functions/tbi-webhook/index.ts"
+
+[functions.tbi-cancel]
+enabled = true
+verify_jwt = true
+import_map = "./functions/tbi-cancel/deno.json"
+entrypoint = "./functions/tbi-cancel/index.ts"
+
+[functions.send-contract]
+enabled = true
+verify_jwt = true
+import_map = "./functions/send-contract/deno.json"
+entrypoint = "./functions/send-contract/index.ts"
+
+[functions.esignatures-webhook]
+enabled = true
+verify_jwt = false
+import_map = "./functions/esignatures-webhook/deno.json"
+entrypoint = "./functions/esignatures-webhook/index.ts"
+
+[functions.update-employee-pii]
+enabled = true
+verify_jwt = true
+import_map = "./functions/update-employee-pii/deno.json"
+entrypoint = "./functions/update-employee-pii/index.ts"
+
+# Admin-only one-shot backfill. Requires admin role — invoked manually after deploy.
+[functions.admin-encrypt-pii]
+enabled = true
+verify_jwt = true
+import_map = "./functions/admin-encrypt-pii/deno.json"
+entrypoint = "./functions/admin-encrypt-pii/index.ts"

@@ -13,49 +13,13 @@ SET client_min_messages = warning;
 SET row_security = off;
 
 
-CREATE EXTENSION IF NOT EXISTS "pg_net" WITH SCHEMA "extensions";
+CREATE SCHEMA IF NOT EXISTS "public";
 
 
-
-
+ALTER SCHEMA "public" OWNER TO "pg_database_owner";
 
 
 COMMENT ON SCHEMA "public" IS 'standard public schema';
-
-
-
-CREATE EXTENSION IF NOT EXISTS "pg_graphql" WITH SCHEMA "graphql";
-
-
-
-
-
-
-CREATE EXTENSION IF NOT EXISTS "pg_stat_statements" WITH SCHEMA "extensions";
-
-
-
-
-
-
-CREATE EXTENSION IF NOT EXISTS "pgcrypto" WITH SCHEMA "extensions";
-
-
-
-
-
-
-CREATE EXTENSION IF NOT EXISTS "supabase_vault" WITH SCHEMA "vault";
-
-
-
-
-
-
-CREATE EXTENSION IF NOT EXISTS "uuid-ossp" WITH SCHEMA "extensions";
-
-
-
 
 
 
@@ -161,6 +125,17 @@ CREATE TYPE "public"."notification_event" AS ENUM (
 
 
 ALTER TYPE "public"."notification_event" OWNER TO "postgres";
+
+
+CREATE TYPE "public"."tbi_loan_status" AS ENUM (
+    'pending',
+    'approved',
+    'rejected',
+    'canceled'
+);
+
+
+ALTER TYPE "public"."tbi_loan_status" OWNER TO "postgres";
 
 
 CREATE TYPE "public"."user_profile_status" AS ENUM (
@@ -721,8 +696,6 @@ CREATE TABLE IF NOT EXISTS "public"."bike_benefits" (
     "delivered_at" timestamp with time zone,
     "created_at" timestamp with time zone DEFAULT "now"() NOT NULL,
     "updated_at" timestamp with time zone DEFAULT "now"() NOT NULL,
-    "live_test_lat" double precision,
-    "live_test_lon" double precision,
     "live_test_location_name" "text",
     "benefit_status" "public"."benefit_status",
     "contract_status" "public"."contract_status",
@@ -738,18 +711,13 @@ CREATE TABLE IF NOT EXISTS "public"."bike_benefits" (
     "employee_full_price" numeric(10,2),
     "employee_monthly_price" numeric(10,2),
     "employee_contract_months" integer,
-    "contract_declined_at" timestamp with time zone
+    "contract_declined_at" timestamp with time zone,
+    "live_test_lat" double precision,
+    "live_test_lon" double precision
 );
 
 
 ALTER TABLE "public"."bike_benefits" OWNER TO "postgres";
-
-
-COMMENT ON COLUMN "public"."bike_benefits"."live_test_lat" IS 'Latitude of the test ride location';
-
-
-COMMENT ON COLUMN "public"."bike_benefits"."live_test_lon" IS 'Longitude of the test ride location';
-
 
 
 COMMENT ON COLUMN "public"."bike_benefits"."live_test_location_name" IS 'Human-readable name of the test location (e.g., "Maros Bike Cluj")';
@@ -908,20 +876,23 @@ COMMENT ON COLUMN "public"."companies"."esignatures_template_id" IS 'eSignatures
 
 
 
+COMMENT ON COLUMN "public"."companies"."days_in_office" IS 'Number of days per week employees commute to the office (1-7). Used for dashboard estimations (distance, calories, CO2, fuel saved).';
+
+
+
 CREATE TABLE IF NOT EXISTS "public"."dealers" (
     "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,
     "name" "text" NOT NULL,
     "address" "text",
-    "lat" double precision,
-    "lon" double precision,
     "phone" "text",
     "created_at" timestamp with time zone DEFAULT "now"(),
-    "updated_at" timestamp with time zone DEFAULT "now"()
+    "updated_at" timestamp with time zone DEFAULT "now"(),
+    "lat" double precision,
+    "lon" double precision
 );
 
 
 ALTER TABLE "public"."dealers" OWNER TO "postgres";
-
 
 
 CREATE TABLE IF NOT EXISTS "public"."profiles" (
@@ -937,10 +908,7 @@ CREATE TABLE IF NOT EXISTS "public"."profiles" (
     "hire_date" bigint,
     "fcm_token" "text",
     "onboarding_status" boolean DEFAULT false,
-    "profile_image_path" "text",
-    "home_address" "text",
-    "home_lat" double precision,
-    "home_lon" double precision
+    "profile_image_path" "text"
 );
 
 
@@ -1082,6 +1050,101 @@ COMMENT ON COLUMN "public"."contracts"."last_webhook_event" IS 'Event string fro
 
 
 
+CREATE TABLE IF NOT EXISTS "public"."employee_pii" (
+    "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,
+    "user_id" "uuid" NOT NULL,
+    "company_id" "uuid" NOT NULL,
+    "national_id_encrypted" "text",
+    "date_of_birth_encrypted" "text",
+    "phone_encrypted" "text",
+    "home_address_encrypted" "text",
+    "home_lat_encrypted" "text",
+    "home_lon_encrypted" "text",
+    "salary_gross_encrypted" "text",
+    "country" "text" DEFAULT 'RO'::"text" NOT NULL,
+    "nationality_iso" "text",
+    "country_of_domicile_iso" "text",
+    "id_document_type" "text",
+    "locality_code" "text",
+    "locality_code_system" "text",
+    "salary_currency" "text" DEFAULT 'RON'::"text",
+    "education_level" "text",
+    "source" "text",
+    "source_ref_id" "text",
+    "created_at" timestamp with time zone DEFAULT "now"() NOT NULL,
+    "updated_at" timestamp with time zone DEFAULT "now"() NOT NULL
+);
+
+
+ALTER TABLE "public"."employee_pii" OWNER TO "postgres";
+
+
+CREATE TABLE IF NOT EXISTS "public"."integration_configs" (
+    "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,
+    "company_id" "uuid" NOT NULL,
+    "integration" "text" NOT NULL,
+    "config" "jsonb" DEFAULT '{}'::"jsonb",
+    "enabled" boolean DEFAULT false,
+    "created_at" timestamp with time zone DEFAULT "now"() NOT NULL,
+    "updated_at" timestamp with time zone DEFAULT "now"() NOT NULL
+);
+
+
+ALTER TABLE "public"."integration_configs" OWNER TO "postgres";
+
+
+CREATE TABLE IF NOT EXISTS "public"."integration_messages" (
+    "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,
+    "company_id" "uuid" NOT NULL,
+    "integration" "text" NOT NULL,
+    "message_id" "uuid",
+    "operation" "text" NOT NULL,
+    "entity_type" "text",
+    "entity_id" "uuid",
+    "direction" "text" DEFAULT 'outbound'::"text" NOT NULL,
+    "request_payload" "jsonb",
+    "response_id" "text",
+    "result_code" "text",
+    "result_payload" "jsonb",
+    "status" "text" DEFAULT 'pending'::"text",
+    "created_at" timestamp with time zone DEFAULT "now"() NOT NULL,
+    "processed_at" timestamp with time zone
+);
+
+
+ALTER TABLE "public"."integration_messages" OWNER TO "postgres";
+
+
+CREATE TABLE IF NOT EXISTS "public"."labor_contracts" (
+    "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,
+    "user_id" "uuid" NOT NULL,
+    "company_id" "uuid" NOT NULL,
+    "employee_pii_id" "uuid" NOT NULL,
+    "contract_number" "text",
+    "contract_date" "date",
+    "start_date" "date",
+    "end_date" "date",
+    "contract_type" "text",
+    "duration_type" "text",
+    "norm_type" "text",
+    "work_schedule" "jsonb",
+    "work_location_type" "text",
+    "work_county" "text",
+    "work_locality_code" "text",
+    "occupation_code" "text",
+    "occupation_code_system" "text",
+    "occupation_code_version" integer,
+    "status" "text" DEFAULT 'active'::"text",
+    "source" "text",
+    "source_ref_id" "text",
+    "created_at" timestamp with time zone DEFAULT "now"() NOT NULL,
+    "updated_at" timestamp with time zone DEFAULT "now"() NOT NULL
+);
+
+
+ALTER TABLE "public"."labor_contracts" OWNER TO "postgres";
+
+
 CREATE TABLE IF NOT EXISTS "public"."profile_invites" (
     "email" "text" NOT NULL,
     "status" "public"."user_profile_status" DEFAULT 'inactive'::"public"."user_profile_status" NOT NULL,
@@ -1184,6 +1247,24 @@ ALTER TABLE "public"."role_permissions" ALTER COLUMN "id" ADD GENERATED BY DEFAU
 
 
 
+CREATE TABLE IF NOT EXISTS "public"."tbi_loan_applications" (
+    "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,
+    "profile_id" "uuid" NOT NULL,
+    "bike_benefit_id" "uuid" NOT NULL,
+    "order_id" "text" NOT NULL,
+    "order_total" numeric(10,2) NOT NULL,
+    "status" "public"."tbi_loan_status" DEFAULT 'pending'::"public"."tbi_loan_status" NOT NULL,
+    "rejection_reason" "text",
+    "redirect_url" "text",
+    "tbi_response" "jsonb",
+    "created_at" timestamp with time zone DEFAULT "now"(),
+    "updated_at" timestamp with time zone DEFAULT "now"()
+);
+
+
+ALTER TABLE "public"."tbi_loan_applications" OWNER TO "postgres";
+
+
 CREATE TABLE IF NOT EXISTS "public"."user_roles" (
     "id" bigint NOT NULL,
     "user_id" "uuid" DEFAULT "auth"."uid"() NOT NULL,
@@ -1249,6 +1330,36 @@ ALTER TABLE ONLY "public"."dealers"
 
 
 
+ALTER TABLE ONLY "public"."employee_pii"
+    ADD CONSTRAINT "employee_pii_pkey" PRIMARY KEY ("id");
+
+
+
+ALTER TABLE ONLY "public"."employee_pii"
+    ADD CONSTRAINT "employee_pii_user_unique" UNIQUE ("user_id");
+
+
+
+ALTER TABLE ONLY "public"."integration_configs"
+    ADD CONSTRAINT "integration_configs_company_integration_unique" UNIQUE ("company_id", "integration");
+
+
+
+ALTER TABLE ONLY "public"."integration_configs"
+    ADD CONSTRAINT "integration_configs_pkey" PRIMARY KEY ("id");
+
+
+
+ALTER TABLE ONLY "public"."integration_messages"
+    ADD CONSTRAINT "integration_messages_pkey" PRIMARY KEY ("id");
+
+
+
+ALTER TABLE ONLY "public"."labor_contracts"
+    ADD CONSTRAINT "labor_contracts_pkey" PRIMARY KEY ("id");
+
+
+
 ALTER TABLE ONLY "public"."profile_invites"
     ADD CONSTRAINT "profile_invites_email_key" UNIQUE ("email");
 
@@ -1281,6 +1392,16 @@ ALTER TABLE ONLY "public"."role_permissions"
 
 ALTER TABLE ONLY "public"."role_permissions"
     ADD CONSTRAINT "role_permissions_role_key" UNIQUE ("role");
+
+
+
+ALTER TABLE ONLY "public"."tbi_loan_applications"
+    ADD CONSTRAINT "tbi_loan_applications_order_id_key" UNIQUE ("order_id");
+
+
+
+ALTER TABLE ONLY "public"."tbi_loan_applications"
+    ADD CONSTRAINT "tbi_loan_applications_pkey" PRIMARY KEY ("id");
 
 
 
@@ -1346,6 +1467,34 @@ CREATE INDEX "idx_contracts_user_id" ON "public"."contracts" USING "btree" ("use
 
 
 
+CREATE INDEX "idx_employee_pii_company" ON "public"."employee_pii" USING "btree" ("company_id");
+
+
+
+CREATE INDEX "idx_integration_messages_company" ON "public"."integration_messages" USING "btree" ("company_id");
+
+
+
+CREATE INDEX "idx_integration_messages_entity" ON "public"."integration_messages" USING "btree" ("entity_type", "entity_id");
+
+
+
+CREATE INDEX "idx_integration_messages_integration" ON "public"."integration_messages" USING "btree" ("integration");
+
+
+
+CREATE INDEX "idx_labor_contracts_company" ON "public"."labor_contracts" USING "btree" ("company_id");
+
+
+
+CREATE INDEX "idx_labor_contracts_pii" ON "public"."labor_contracts" USING "btree" ("employee_pii_id");
+
+
+
+CREATE INDEX "idx_labor_contracts_user" ON "public"."labor_contracts" USING "btree" ("user_id");
+
+
+
 CREATE INDEX "idx_profile_invites_company_id" ON "public"."profile_invites" USING "btree" ("company_id");
 
 
@@ -1374,6 +1523,18 @@ CREATE INDEX "idx_profiles_last_name" ON "public"."profiles" USING "btree" ("las
 
 
 
+CREATE INDEX "idx_tbi_loan_apps_benefit" ON "public"."tbi_loan_applications" USING "btree" ("bike_benefit_id");
+
+
+
+CREATE INDEX "idx_tbi_loan_apps_order" ON "public"."tbi_loan_applications" USING "btree" ("order_id");
+
+
+
+CREATE INDEX "idx_tbi_loan_apps_profile" ON "public"."tbi_loan_applications" USING "btree" ("profile_id");
+
+
+
 CREATE UNIQUE INDEX "user_roles_user_role_idx" ON "public"."user_roles" USING "btree" ("user_id", "role");
 
 
@@ -1399,6 +1560,22 @@ CREATE OR REPLACE TRIGGER "update_bikes_updated_at" BEFORE UPDATE ON "public"."b
 
 
 CREATE OR REPLACE TRIGGER "update_contract_status_on_change" BEFORE INSERT OR UPDATE ON "public"."bike_benefits" FOR EACH ROW EXECUTE FUNCTION "public"."update_contract_status"();
+
+
+
+CREATE OR REPLACE TRIGGER "update_employee_pii_updated_at" BEFORE UPDATE ON "public"."employee_pii" FOR EACH ROW EXECUTE FUNCTION "public"."update_updated_at_column"();
+
+
+
+CREATE OR REPLACE TRIGGER "update_integration_configs_updated_at" BEFORE UPDATE ON "public"."integration_configs" FOR EACH ROW EXECUTE FUNCTION "public"."update_updated_at_column"();
+
+
+
+CREATE OR REPLACE TRIGGER "update_labor_contracts_updated_at" BEFORE UPDATE ON "public"."labor_contracts" FOR EACH ROW EXECUTE FUNCTION "public"."update_updated_at_column"();
+
+
+
+CREATE OR REPLACE TRIGGER "update_tbi_loan_apps_updated_at" BEFORE UPDATE ON "public"."tbi_loan_applications" FOR EACH ROW EXECUTE FUNCTION "public"."update_updated_at_column"();
 
 
 
@@ -1442,6 +1619,41 @@ ALTER TABLE ONLY "public"."contracts"
 
 
 
+ALTER TABLE ONLY "public"."employee_pii"
+    ADD CONSTRAINT "employee_pii_company_id_fkey" FOREIGN KEY ("company_id") REFERENCES "public"."companies"("id");
+
+
+
+ALTER TABLE ONLY "public"."employee_pii"
+    ADD CONSTRAINT "employee_pii_user_id_fkey" FOREIGN KEY ("user_id") REFERENCES "public"."profiles"("user_id") ON DELETE CASCADE;
+
+
+
+ALTER TABLE ONLY "public"."integration_configs"
+    ADD CONSTRAINT "integration_configs_company_id_fkey" FOREIGN KEY ("company_id") REFERENCES "public"."companies"("id");
+
+
+
+ALTER TABLE ONLY "public"."integration_messages"
+    ADD CONSTRAINT "integration_messages_company_id_fkey" FOREIGN KEY ("company_id") REFERENCES "public"."companies"("id");
+
+
+
+ALTER TABLE ONLY "public"."labor_contracts"
+    ADD CONSTRAINT "labor_contracts_company_id_fkey" FOREIGN KEY ("company_id") REFERENCES "public"."companies"("id");
+
+
+
+ALTER TABLE ONLY "public"."labor_contracts"
+    ADD CONSTRAINT "labor_contracts_employee_pii_id_fkey" FOREIGN KEY ("employee_pii_id") REFERENCES "public"."employee_pii"("id") ON DELETE CASCADE;
+
+
+
+ALTER TABLE ONLY "public"."labor_contracts"
+    ADD CONSTRAINT "labor_contracts_user_id_fkey" FOREIGN KEY ("user_id") REFERENCES "public"."profiles"("user_id") ON DELETE CASCADE;
+
+
+
 ALTER TABLE ONLY "public"."profile_invites"
     ADD CONSTRAINT "profile_invites_company_id_fkey" FOREIGN KEY ("company_id") REFERENCES "public"."companies"("id");
 
@@ -1462,6 +1674,16 @@ ALTER TABLE ONLY "public"."profiles"
 
 
 
+ALTER TABLE ONLY "public"."tbi_loan_applications"
+    ADD CONSTRAINT "tbi_loan_applications_bike_benefit_id_fkey" FOREIGN KEY ("bike_benefit_id") REFERENCES "public"."bike_benefits"("id") ON DELETE CASCADE;
+
+
+
+ALTER TABLE ONLY "public"."tbi_loan_applications"
+    ADD CONSTRAINT "tbi_loan_applications_profile_id_fkey" FOREIGN KEY ("profile_id") REFERENCES "public"."profiles"("user_id") ON DELETE CASCADE;
+
+
+
 ALTER TABLE ONLY "public"."user_roles"
     ADD CONSTRAINT "user_roles_user_id_profiles_fkey" FOREIGN KEY ("user_id") REFERENCES "public"."profiles"("user_id") ON UPDATE CASCADE ON DELETE CASCADE;
 
@@ -1476,6 +1698,12 @@ CREATE POLICY "Authenticated users can read permissions" ON "public"."role_permi
 
 
 CREATE POLICY "Authenticated users can view dealers" ON "public"."dealers" FOR SELECT TO "authenticated" USING (true);
+
+
+
+CREATE POLICY "Employees can view own invite" ON "public"."profile_invites" FOR SELECT TO "authenticated" USING (("email" = ( SELECT "p"."email"
+   FROM "public"."profiles" "p"
+  WHERE ("p"."user_id" = "auth"."uid"()))));
 
 
 
@@ -1602,11 +1830,47 @@ CREATE POLICY "contracts_hr_admin_select" ON "public"."contracts" FOR SELECT TO 
 ALTER TABLE "public"."dealers" ENABLE ROW LEVEL SECURITY;
 
 
+ALTER TABLE "public"."employee_pii" ENABLE ROW LEVEL SECURITY;
+
+
+CREATE POLICY "employee_pii_hr_select" ON "public"."employee_pii" FOR SELECT TO "authenticated" USING (((("auth"."jwt"() ->> 'user_role'::"text") = ANY (ARRAY['hr'::"text", 'admin'::"text"])) AND ("company_id" = "public"."auth_company_id"())));
+
+
+
+CREATE POLICY "employee_pii_self_select" ON "public"."employee_pii" FOR SELECT TO "authenticated" USING (("user_id" = "auth"."uid"()));
+
+
+
 CREATE POLICY "hr_admin_select_own_company_notifications" ON "public"."company_notifications" FOR SELECT TO "authenticated" USING ((("company_id" = "public"."auth_company_id"()) AND (("auth"."jwt"() ->> 'user_role'::"text") = ANY (ARRAY['hr'::"text", 'admin'::"text"]))));
 
 
 
 CREATE POLICY "hr_select_own_company_profiles" ON "public"."profiles" FOR SELECT TO "authenticated" USING (((("auth"."jwt"() ->> 'user_role'::"text") = 'hr'::"text") AND ("company_id" = "public"."auth_company_id"())));
+
+
+
+ALTER TABLE "public"."integration_configs" ENABLE ROW LEVEL SECURITY;
+
+
+CREATE POLICY "integration_configs_hr_select" ON "public"."integration_configs" FOR SELECT TO "authenticated" USING (((("auth"."jwt"() ->> 'user_role'::"text") = ANY (ARRAY['hr'::"text", 'admin'::"text"])) AND ("company_id" = "public"."auth_company_id"())));
+
+
+
+ALTER TABLE "public"."integration_messages" ENABLE ROW LEVEL SECURITY;
+
+
+CREATE POLICY "integration_messages_hr_select" ON "public"."integration_messages" FOR SELECT TO "authenticated" USING (((("auth"."jwt"() ->> 'user_role'::"text") = ANY (ARRAY['hr'::"text", 'admin'::"text"])) AND ("company_id" = "public"."auth_company_id"())));
+
+
+
+ALTER TABLE "public"."labor_contracts" ENABLE ROW LEVEL SECURITY;
+
+
+CREATE POLICY "labor_contracts_hr_select" ON "public"."labor_contracts" FOR SELECT TO "authenticated" USING (((("auth"."jwt"() ->> 'user_role'::"text") = ANY (ARRAY['hr'::"text", 'admin'::"text"])) AND ("company_id" = "public"."auth_company_id"())));
+
+
+
+CREATE POLICY "labor_contracts_self_select" ON "public"."labor_contracts" FOR SELECT TO "authenticated" USING (("user_id" = "auth"."uid"()));
 
 
 
@@ -1631,6 +1895,21 @@ CREATE POLICY "profiles_self_update" ON "public"."profiles" FOR UPDATE TO "authe
 ALTER TABLE "public"."role_permissions" ENABLE ROW LEVEL SECURITY;
 
 
+ALTER TABLE "public"."tbi_loan_applications" ENABLE ROW LEVEL SECURITY;
+
+
+CREATE POLICY "tbi_loan_employee_select" ON "public"."tbi_loan_applications" FOR SELECT TO "authenticated" USING (("profile_id" = "auth"."uid"()));
+
+
+
+CREATE POLICY "tbi_loan_hr_select" ON "public"."tbi_loan_applications" FOR SELECT TO "authenticated" USING (((EXISTS ( SELECT 1
+   FROM "public"."user_roles" "ur"
+  WHERE (("ur"."user_id" = "auth"."uid"()) AND ("ur"."role" = ANY (ARRAY['hr'::"public"."user_role", 'admin'::"public"."user_role"]))))) AND (EXISTS ( SELECT 1
+   FROM "public"."profiles" "p"
+  WHERE (("p"."user_id" = "tbi_loan_applications"."profile_id") AND ("p"."company_id" = "public"."auth_company_id"()))))));
+
+
+
 ALTER TABLE "public"."user_roles" ENABLE ROW LEVEL SECURITY;
 
 
@@ -1640,185 +1919,11 @@ CREATE POLICY "user_roles_hr_select" ON "public"."user_roles" FOR SELECT TO "aut
 
 
 
-
-
-ALTER PUBLICATION "supabase_realtime" OWNER TO "postgres";
-
-
-
-
-
-
-ALTER PUBLICATION "supabase_realtime" ADD TABLE ONLY "public"."bike_benefits";
-
-
-
-ALTER PUBLICATION "supabase_realtime" ADD TABLE ONLY "public"."company_notifications";
-
-
-
-ALTER PUBLICATION "supabase_realtime" ADD TABLE ONLY "public"."profiles";
-
-
-
-
-
-
 GRANT USAGE ON SCHEMA "public" TO "postgres";
 GRANT USAGE ON SCHEMA "public" TO "anon";
 GRANT USAGE ON SCHEMA "public" TO "authenticated";
 GRANT USAGE ON SCHEMA "public" TO "service_role";
 GRANT USAGE ON SCHEMA "public" TO "supabase_auth_admin";
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 
 
@@ -1912,21 +2017,6 @@ GRANT ALL ON FUNCTION "public"."update_updated_at_column"() TO "service_role";
 
 
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 GRANT ALL ON TABLE "public"."bike_benefits" TO "anon";
 GRANT ALL ON TABLE "public"."bike_benefits" TO "authenticated";
 GRANT ALL ON TABLE "public"."bike_benefits" TO "service_role";
@@ -1981,6 +2071,30 @@ GRANT ALL ON TABLE "public"."contracts" TO "service_role";
 
 
 
+GRANT ALL ON TABLE "public"."employee_pii" TO "anon";
+GRANT ALL ON TABLE "public"."employee_pii" TO "authenticated";
+GRANT ALL ON TABLE "public"."employee_pii" TO "service_role";
+
+
+
+GRANT ALL ON TABLE "public"."integration_configs" TO "anon";
+GRANT ALL ON TABLE "public"."integration_configs" TO "authenticated";
+GRANT ALL ON TABLE "public"."integration_configs" TO "service_role";
+
+
+
+GRANT ALL ON TABLE "public"."integration_messages" TO "anon";
+GRANT ALL ON TABLE "public"."integration_messages" TO "authenticated";
+GRANT ALL ON TABLE "public"."integration_messages" TO "service_role";
+
+
+
+GRANT ALL ON TABLE "public"."labor_contracts" TO "anon";
+GRANT ALL ON TABLE "public"."labor_contracts" TO "authenticated";
+GRANT ALL ON TABLE "public"."labor_contracts" TO "service_role";
+
+
+
 GRANT ALL ON TABLE "public"."profile_invites" TO "anon";
 GRANT ALL ON TABLE "public"."profile_invites" TO "authenticated";
 GRANT ALL ON TABLE "public"."profile_invites" TO "service_role";
@@ -2005,6 +2119,12 @@ GRANT ALL ON SEQUENCE "public"."role_permissions_id_seq" TO "service_role";
 
 
 
+GRANT ALL ON TABLE "public"."tbi_loan_applications" TO "anon";
+GRANT ALL ON TABLE "public"."tbi_loan_applications" TO "authenticated";
+GRANT ALL ON TABLE "public"."tbi_loan_applications" TO "service_role";
+
+
+
 GRANT ALL ON TABLE "public"."user_roles" TO "service_role";
 GRANT ALL ON TABLE "public"."user_roles" TO "supabase_auth_admin";
 GRANT SELECT ON TABLE "public"."user_roles" TO "authenticated";
@@ -2014,12 +2134,6 @@ GRANT SELECT ON TABLE "public"."user_roles" TO "authenticated";
 GRANT ALL ON SEQUENCE "public"."user_roles_id_seq" TO "anon";
 GRANT ALL ON SEQUENCE "public"."user_roles_id_seq" TO "authenticated";
 GRANT ALL ON SEQUENCE "public"."user_roles_id_seq" TO "service_role";
-
-
-
-
-
-
 
 
 
@@ -2047,30 +2161,6 @@ ALTER DEFAULT PRIVILEGES FOR ROLE "postgres" IN SCHEMA "public" GRANT ALL ON TAB
 ALTER DEFAULT PRIVILEGES FOR ROLE "postgres" IN SCHEMA "public" GRANT ALL ON TABLES TO "anon";
 ALTER DEFAULT PRIVILEGES FOR ROLE "postgres" IN SCHEMA "public" GRANT ALL ON TABLES TO "authenticated";
 ALTER DEFAULT PRIVILEGES FOR ROLE "postgres" IN SCHEMA "public" GRANT ALL ON TABLES TO "service_role";
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 
 

@@ -57,6 +57,7 @@ export const NotificationEvent = {
   CONTRACT_READY:     "contract_ready",
   CONTRACT_SIGNED_HR: "contract_signed_hr",
   CONTRACT_APPROVED:  "contract_approved",
+  LOAN_STATUS_UPDATE: "loan_status_update",
 } as const
 
 export type NotificationEventType = typeof NotificationEvent[keyof typeof NotificationEvent]
@@ -90,10 +91,19 @@ export const Errors = {
   BIKE_NOT_FOUND: { error: "bike_not_found" },
   NO_TEMPLATE: { error: "no_esignatures_template" },
   CONTRACT_ALREADY_REQUESTED: { error: "contract_already_requested" },
+  INVALID_BENEFIT_STEP: { error: "invalid_benefit_step", reason: "step_must_be_sign_contract" },
   ESIGNATURES_API_FAILED: { error: "esignatures_api_failed" },
   // Notification errors (non-fatal, logged only)
   FCM_SEND_FAILED: { error: "fcm_send_failed" },
   BROADCAST_FAILED: { error: "broadcast_failed" },
+  // TBI loan errors
+  TBI_CREDENTIALS_MISSING: { error: "tbi_credentials_missing" },
+  TBI_API_FAILED: { error: "tbi_api_failed" },
+  LOAN_NOT_FOUND: { error: "loan_not_found" },
+  LOAN_NOT_CANCELABLE: { error: "loan_not_cancelable" },
+  // PII / employee details errors
+  PII_KEY_MISSING: { error: "pii_encryption_key_missing" },
+  PII_DECRYPT_FAILED: { error: "pii_decrypt_failed" },
 } as const
 
 export function forbidden(error = Errors.FORBIDDEN, origin?: string): Response {

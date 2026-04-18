@@ -1,0 +1,127 @@
+ACORD-CADRU PRIVIND BENEFICIUL DE MOBILITATE URBANA (eBike)
+PROFORMA / PRE-ACORD
+
+Data: {{begin_date}}
+
+────────────────────────────────────────────────────────────────
+
+PARTILE CONTRACTANTE
+
+1. ANGAJATORUL (Societatea)
+
+Denumirea: {{company_name}}
+Sediul social: {{company_address}}
+Email de contact: {{company_contact_email}}
+Reprezentat prin departamentul Resurse Umane
+
+2. ANGAJATUL (Beneficiarul)
+
+Nume si prenume: {{last_name}} {{first_name}}
+Email: {{email}}
+Departament: {{department}}
+Data angajarii: {{hire_date}}
+
+────────────────────────────────────────────────────────────────
+
+ARTICOLUL 1 - OBIECTUL ACORDULUI
+
+1.1. Prin prezentul acord, Angajatorul pune la dispozitia Angajatului un beneficiu de mobilitate urbana sub forma unei biciclete electrice (eBike), in cadrul programului MobiPass de beneficii pentru angajati.
+
+1.2. Angajatorul achizitioneaza bicicleta electrica descrisa la Articolul 2 si o pune la dispozitia Angajatului in conditiile prezentului acord, pentru o perioada determinata.
+
+────────────────────────────────────────────────────────────────
+
+ARTICOLUL 2 - DESCRIEREA BUNULUI
+
+Denumirea produsului: {{bike_name}}
+Marca: {{bike_brand}}
+Pretul integral al bicicletei: {{bike_full_price}} {{currency}}
+
+────────────────────────────────────────────────────────────────
+
+ARTICOLUL 3 - CONDITII FINANCIARE
+
+3.1. Valoarea totala suportata de Angajat: {{employee_full_price}} {{currency}}
+
+3.2. Rata lunara retinuta din salariul Angajatului: {{employee_monthly_price}} {{currency}}/luna
+
+3.3. Durata acordului: {{contract_months}} luni, incepand cu data semnarii prezentului acord de catre ambele parti.
+
+3.4. Retinerea lunara se va efectua prin diminuarea corespunzatoare a venitului brut lunar al Angajatului, cu acordul expres al acestuia, conform legislatiei muncii in vigoare.
+
+────────────────────────────────────────────────────────────────
+
+ARTICOLUL 4 - DURATA SI INCETAREA
+
+4.1. Prezentul acord intra in vigoare la data semnarii de catre ambele parti si este valabil pe o durata de {{contract_months}} luni.
+
+4.2. Acordul poate inceta inainte de termen prin:
+   a) Acordul scris al ambelor parti;
+   b) Incetarea raporturilor de munca dintre parti, caz in care Angajatul va restitui bicicleta sau va achita valoarea ramasa neacoperita;
+   c) Notificare scrisa cu un preaviz de 30 de zile calendaristice.
+
+4.3. In cazul incetarii anticipate, Angajatul datoreaza diferenta dintre valoarea totala a beneficiului si sumele deja retinute.
+
+────────────────────────────────────────────────────────────────
+
+ARTICOLUL 5 - OBLIGATIILE ANGAJATULUI
+
+5.1. Angajatul se obliga:
+   a) Sa utilizeze bicicleta electrica cu diligenta si in conformitate cu instructiunile producatorului;
+   b) Sa nu instraineze, sa nu cedeze si sa nu gajeze bicicleta pe durata acordului;
+   c) Sa informeze imediat Angajatorul in cazul deteriorarii, furtului sau pierderii bicicletei;
+   d) Sa returneze bicicleta in stare corespunzatoare la incetarea acordului, daca valoarea totala nu a fost acoperita integral.
+
+────────────────────────────────────────────────────────────────
+
+ARTICOLUL 6 - OBLIGATIILE ANGAJATORULUI
+
+6.1. Angajatorul se obliga:
+   a) Sa achizitioneze si sa puna la dispozitia Angajatului bicicleta electrica descrisa la Articolul 2;
+   b) Sa asigure transparenta calculului ratelor lunare;
+   c) Sa notifice Angajatul cu privire la orice modificare a conditiilor financiare, cu minimum 30 de zile inainte.
+
+────────────────────────────────────────────────────────────────
+
+ARTICOLUL 7 - RASPUNDERE SI RISC
+
+7.1. Riscul deteriorarii sau pierderii bicicletei electrice trece asupra Angajatului din momentul predarii/livrarii bunului.
+
+7.2. Angajatul este responsabil pentru asigurarea bicicletei impotriva furtului si a daunelor accidentale, conform politicii interne a companiei.
+
+────────────────────────────────────────────────────────────────
+
+ARTICOLUL 8 - TRANSFER DE PROPRIETATE
+
+8.1. La achitarea integrala a valorii prevazute la Articolul 3.1, dreptul de proprietate asupra bicicletei electrice se transfera automat catre Angajat, fara alte formalitati suplimentare.
+
+────────────────────────────────────────────────────────────────
+
+ARTICOLUL 9 - CONFIDENTIALITATE
+
+9.1. Conditiile financiare ale prezentului acord sunt confidentiale. Partile se obliga sa nu divulge tertilor informatiile cuprinse in prezentul acord, cu exceptia cazurilor prevazute de lege.
+
+────────────────────────────────────────────────────────────────
+
+ARTICOLUL 10 - DISPOZITII FINALE
+
+10.1. Prezentul acord reprezinta un pre-acord (proforma) intre parti si constituie vointa expresa a acestora de a incheia un contract definitiv in conditiile descrise mai sus.
+
+10.2. Orice modificare a prezentului acord se face prin act aditional semnat de ambele parti.
+
+10.3. Prezentul acord a fost intocmit in doua exemplare originale, cate unul pentru fiecare parte, si semnat electronic prin platforma eSignatures.com.
+
+────────────────────────────────────────────────────────────────
+
+ANGAJATORUL                              ANGAJATUL
+
+{{company_name}}                         {{first_name}} {{last_name}}
+Departament Resurse Umane                Departament: {{department}}
+
+Data: {{begin_date}}                     Data: {{begin_date}}
+
+Semnatura: _________________             Semnatura: _________________
+
+────────────────────────────────────────────────────────────────
+
+Prin semnarea prezentului document, confirm ca am citit, am inteles si sunt de acord cu toate clauzele de mai sus.

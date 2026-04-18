@@ -1,6 +1,6 @@
 // Setup type definitions for built-in Supabase Runtime APIs
 import "jsr:@supabase/functions-js/edge-runtime.d.ts"
-import { Errors, ESIGNATURES_API_URL, ESIGNATURES_VAULT_KEY, NotificationEvent, badRequest, json } from "../_shared/constants.ts"
+import { Errors, ESIGNATURES_API_URL, ESIGNATURES_VAULT_KEY, NotificationEvent, badRequest, forbidden, json } from "../_shared/constants.ts"
 import { corsResponse } from "../_shared/ioHelpers.ts"
 import { requireJwt, extractUserId } from "../_shared/auth.ts"
 import { makeRestClient, RestClient } from "../_shared/supabaseRest.ts"
@@ -21,6 +21,8 @@ interface Profile {
 interface Company {
   name: string
   esignatures_template_id: string
+  address: string | null
+  contact_email: string | null
 }
 
 interface BikeBenefit {
@@ -31,6 +33,7 @@ interface BikeBenefit {
   employee_monthly_price: number | null
   employee_contract_months: number | null
   employee_currency: string | null
+  step: string | null
 }
 
 interface Bike {
@@ -68,7 +71,8 @@ async function loadProfile(db: RestClient, userId: string, origin?: string): Pro
 async function loadCompany(db: RestClient, companyId: string, origin?: string): Promise<Company> {
   const company = await db.getOne<Company>(
     "companies",
-    `id=eq.${companyId}`
+    `id=eq.${companyId}`,
+    "name,esignatures_template_id,address,contact_email"
   )
   if (!company)                         throw badRequest(Errors.NO_COMPANY, undefined, origin)
   if (!company.esignatures_template_id) throw badRequest(Errors.NO_TEMPLATE, undefined, origin)
@@ -89,7 +93,7 @@ async function loadBikeBenefit(db: RestClient, userId: string, origin?: string):
   const benefit = await db.getOne<BikeBenefit>(
     "bike_benefits",
     `user_id=eq.${encodeURIComponent(userId)}`,
-    "id,bike_id,contract_requested_at,employee_full_price,employee_monthly_price,employee_contract_months,employee_currency"
+    "id,bike_id,contract_requested_at,employee_full_price,employee_monthly_price,employee_contract_months,employee_currency,step"
   )
   if (!benefit)                      throw badRequest(Errors.NO_BIKE_BENEFIT, undefined, origin)
   if (!benefit.bike_id)              throw badRequest(Errors.NO_BIKE_SELECTED, undefined, origin)
@@ -133,6 +137,8 @@ function buildPlaceholders(profile: Profile, company: Company, bike: Bike, benef
     { api_key: "department",             value: profile.department ?? "" },
     { api_key: "hire_date",              value: hireDate },
     { api_key: "company_name",           value: company.name ?? "" },
+    { api_key: "company_address",        value: company.address ?? "" },
+    { api_key: "company_contact_email",  value: company.contact_email ?? "" },
     { api_key: "bike_name",              value: bike.name ?? "" },
     { api_key: "bike_brand",             value: bike.brand ?? "" },
     { api_key: "bike_full_price",        value: String(bike.full_price ?? "") },
@@ -140,6 +146,7 @@ function buildPlaceholders(profile: Profile, company: Company, bike: Bike, benef
     { api_key: "employee_monthly_price", value: String(benefit.employee_monthly_price ?? "") },
     { api_key: "contract_months",        value: String(benefit.employee_contract_months ?? "") },
     { api_key: "currency",               value: benefit.employee_currency ?? "" },
+    { api_key: "begin_date",             value: new Date().toISOString().split("T")[0] },
   ]
 }
 
@@ -211,10 +218,29 @@ Deno.serve(async (req) => {
     const jwt    = requireJwt(req, origin)
     const userId = extractUserId(jwt, origin)
 
+    // Verify caller has employee role
+    const role = await db.getOne<{ role: string }>(
+      "user_roles",
+      `user_id=eq.${userId}&role=eq.employee`,
+      "role"
+    )
+    if (!role) throw forbidden(undefined, origin)
+
     const profile = await loadProfile(db, userId, origin)
     const company = await loadCompany(db, profile.company_id, origin)
     const hr = await loadHR(db, profile.company_id, origin)
     const benefit = await loadBikeBenefit(db, userId, origin)
+
+    // Guard: prevent duplicate contract requests
+    if (benefit.contract_requested_at) {
+      throw badRequest(Errors.CONTRACT_ALREADY_REQUESTED, undefined, origin)
+    }
+
+    // Guard: benefit must be at sign_contract step
+    if (benefit.step !== "sign_contract") {
+      throw badRequest(Errors.INVALID_BENEFIT_STEP, undefined, origin)
+    }
+
     const bike    = await loadBike(db, benefit.bike_id!, origin)
     const apiKey  = await loadApiKey(db, origin)
 
