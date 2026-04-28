@@ -28,7 +28,7 @@ DECLARE
   v_email text := 'pgtap-00004@test.local';
 BEGIN
   INSERT INTO public.companies (name, monthly_benefit_subsidy, contract_months, currency)
-  VALUES ('BigTech1', 50.00, 24, 'EUR')
+  VALUES ('reg-co-' || gen_random_uuid()::text, 50.00, 24, 'EUR')
   RETURNING id INTO v_co;
 
   -- Pre-create the invite so the trigger can resolve company_id

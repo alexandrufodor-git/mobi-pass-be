@@ -36,9 +36,13 @@ interface Company {
   name: string
   logo_image_path: string | null
   contact_email: string | null
+  address: string | null
   address_lat: number | null
   address_lon: number | null
   days_in_office: number | null
+  monthly_benefit_subsidy: number | null
+  contract_months: number | null
+  currency: string | null
 }
 
 interface BikeBenefit {
@@ -158,7 +162,7 @@ Deno.serve(async (req) => {
       db.getOne<Company>(
         "companies",
         `id=eq.${profile.company_id}`,
-        "name,logo_image_path,contact_email,address_lat,address_lon,days_in_office"
+        "name,logo_image_path,contact_email,address,address_lat,address_lon,days_in_office,monthly_benefit_subsidy,contract_months,currency"
       ),
     ])
 
@@ -270,9 +274,13 @@ Deno.serve(async (req) => {
       helmet:                   bikeOrder?.helmet ?? null,
       insurance:                bikeOrder?.insurance ?? null,
 
-      company_address_lat:      company?.address_lat ?? null,
-      company_address_lon:      company?.address_lon ?? null,
-      days_in_office:           company?.days_in_office ?? null,
+      company_address:             company?.address ?? null,
+      company_address_lat:         company?.address_lat ?? null,
+      company_address_lon:         company?.address_lon ?? null,
+      days_in_office:              company?.days_in_office ?? null,
+      company_monthly_benefit_subsidy: company?.monthly_benefit_subsidy ?? null,
+      company_contract_months:     company?.contract_months ?? null,
+      company_currency:            company?.currency ?? null,
 
       pii,
     }

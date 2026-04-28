@@ -27,7 +27,7 @@ DECLARE
   v_bb2 UUID;
 BEGIN
   INSERT INTO public.companies (name, monthly_benefit_subsidy, contract_months, currency)
-  VALUES ('8x8', 100.00, 12, 'EUR')
+  VALUES ('benefit-co-' || gen_random_uuid()::text, 100.00, 12, 'EUR')
   RETURNING id INTO v_co;
 
   -- Insert minimal auth.users row to satisfy profiles FK

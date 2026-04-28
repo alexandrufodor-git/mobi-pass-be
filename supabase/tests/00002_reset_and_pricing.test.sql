@@ -28,7 +28,7 @@ DECLARE
 BEGIN
   -- Company: subsidy=100, months=12 → employee_full_price = GREATEST(0, 1500-1200) = 300
   INSERT INTO public.companies (name, monthly_benefit_subsidy, contract_months, currency)
-  VALUES ('8x8', 100.00, 12, 'EUR')
+  VALUES ('pricing-co-' || gen_random_uuid()::text, 100.00, 12, 'EUR')
   RETURNING id INTO v_co;
 
   INSERT INTO auth.users (id, instance_id, aud, role, email, encrypted_password,

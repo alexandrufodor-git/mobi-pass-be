@@ -23,10 +23,10 @@ DECLARE
   v_out    uuid := gen_random_uuid();
 BEGIN
   INSERT INTO public.companies (name, monthly_benefit_subsidy, contract_months, currency)
-  VALUES ('BigTech1', 100.00, 12, 'EUR') RETURNING id INTO v_co_a;
+  VALUES ('rls-co-a-' || gen_random_uuid()::text, 100.00, 12, 'EUR') RETURNING id INTO v_co_a;
 
   INSERT INTO public.companies (name, monthly_benefit_subsidy, contract_months, currency)
-  VALUES ('SmallTech2', 100.00, 12, 'EUR') RETURNING id INTO v_co_b;
+  VALUES ('rls-co-b-' || gen_random_uuid()::text, 100.00, 12, 'EUR') RETURNING id INTO v_co_b;
 
   INSERT INTO auth.users (id, instance_id, aud, role, email, encrypted_password, created_at, updated_at, confirmation_token, email_change, email_change_token_new, recovery_token)
   VALUES

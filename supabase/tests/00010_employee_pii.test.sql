@@ -32,12 +32,12 @@ DECLARE
   v_pii_a   uuid;
   v_pii_b   uuid;
 BEGIN
-  -- Two companies
+  -- Two companies (unique names so tests don't clash with seed data)
   INSERT INTO public.companies (name, monthly_benefit_subsidy, contract_months, currency)
-  VALUES ('8x8', 72.00, 36, 'RON') RETURNING id INTO v_co_a;
+  VALUES ('pii-co-a-' || gen_random_uuid()::text, 72.00, 36, 'RON') RETURNING id INTO v_co_a;
 
   INSERT INTO public.companies (name, monthly_benefit_subsidy, contract_months, currency)
-  VALUES ('BigTech1', 100.00, 12, 'EUR') RETURNING id INTO v_co_b;
+  VALUES ('pii-co-b-' || gen_random_uuid()::text, 100.00, 12, 'EUR') RETURNING id INTO v_co_b;
 
   -- Users in auth.users
   INSERT INTO auth.users (id, instance_id, aud, role, email, encrypted_password, created_at, updated_at, confirmation_token, email_change, email_change_token_new, recovery_token)

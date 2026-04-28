@@ -455,3 +455,17 @@ enabled = true
 verify_jwt = true
 import_map = "./functions/admin-encrypt-pii/deno.json"
 entrypoint = "./functions/admin-encrypt-pii/index.ts"
+
+# E2E test harness — seed/reset test accounts. Gated by X-E2E-Secret header.
+[functions.e2e-seed]
+enabled = true
+verify_jwt = false
+import_map = "./functions/e2e-seed/deno.json"
+entrypoint = "./functions/e2e-seed/index.ts"
+
+# E2E test harness — fetch latest OTP for test emails. Gated by X-E2E-Secret.
+[functions.e2e-otp]
+enabled = true
+verify_jwt = false
+import_map = "./functions/e2e-otp/deno.json"
+entrypoint = "./functions/e2e-otp/index.ts"

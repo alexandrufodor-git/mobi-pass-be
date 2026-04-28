@@ -32,10 +32,10 @@ DECLARE
 BEGIN
   -- Two companies
   INSERT INTO public.companies (name, monthly_benefit_subsidy, contract_months, currency)
-  VALUES ('8x8', 72.00, 36, 'RON') RETURNING id INTO v_co1;
+  VALUES ('tbi-co1-' || gen_random_uuid()::text, 72.00, 36, 'RON') RETURNING id INTO v_co1;
 
   INSERT INTO public.companies (name, monthly_benefit_subsidy, contract_months, currency)
-  VALUES ('BigTech1', 100.00, 24, 'EUR') RETURNING id INTO v_co2;
+  VALUES ('tbi-co2-' || gen_random_uuid()::text, 100.00, 24, 'EUR') RETURNING id INTO v_co2;
 
   -- Auth users
   INSERT INTO auth.users (id, instance_id, aud, role, email, encrypted_password, created_at, updated_at, confirmation_token, email_change, email_change_token_new, recovery_token)
