@@ -2,7 +2,8 @@
 # Focused audit of the REGES bridge state. Read-only.
 #
 # Usage:
-#   ./scripts/dev/show-audit.sh [view]                    # local dev (dev company)
+#   ./scripts/dev/show-audit.sh [view]                    # local dev, all companies
+#   ./scripts/dev/show-audit.sh <uuid> [view]             # local dev, one company
 #   ./scripts/dev/show-audit.sh --prod [view]             # production, all companies
 #   ./scripts/dev/show-audit.sh --prod <uuid> [view]      # production, one company
 #
@@ -32,6 +33,10 @@ while [[ $# -gt 0 ]]; do
       VIEW="$1"
       shift
       ;;
+    [0-9a-f]*-[0-9a-f]*-[0-9a-f]*-[0-9a-f]*-[0-9a-f]*)
+      COMPANY_ID="$1"
+      shift
+      ;;
     *)
       echo "unknown argument: $1" >&2; exit 1 ;;
   esac
@@ -46,7 +51,6 @@ if $PROD; then
   FOLLOW_INTERVAL=5
   MODE="prod"
 else
-  COMPANY_ID="${COMPANY_ID:-44444444-4444-4444-4444-444444444444}"
   if ! supabase status -o env > /dev/null 2>&1; then
     echo "✗ Supabase not running. Use --prod to target production." >&2; exit 1
   fi
