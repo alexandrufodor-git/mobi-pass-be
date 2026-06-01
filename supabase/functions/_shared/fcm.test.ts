@@ -40,6 +40,7 @@ function makeMockDb(
   return {
     getOne: () => Promise.resolve(getOneReturn as never),
     post: () => Promise.resolve(new Response(null, { status: 201 })),
+    upsert: () => Promise.resolve(new Response(null, { status: 201 })),
     patch: () => Promise.resolve(),
     rpc: () => {
       const val = rpcReturns[rpcCall++] ?? null

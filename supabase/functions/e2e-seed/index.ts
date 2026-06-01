@@ -1,8 +1,13 @@
 // Setup type definitions for built-in Supabase Runtime APIs
 import "jsr:@supabase/functions-js/edge-runtime.d.ts"
 import { encrypt } from "../_shared/piiCrypto.ts"
-import { birthDateHash } from "../_shared/piiLookup.ts"
 import { makeRestClient } from "../_shared/supabaseRest.ts"
+import {
+  ingestRegesArray,
+  type CompanyCtx,
+  type RegesRecord,
+} from "../_shared/regesIngest.ts"
+import type { EmailPatternKind } from "../_shared/emailPattern.ts"
 
 /**
  * e2e-seed — Test account bootstrap & reset for Maestro flows.
@@ -13,79 +18,91 @@ import { makeRestClient } from "../_shared/supabaseRest.ts"
  *
  * Vault secrets (set via scripts/setup-e2e-vault.sh for local, or SQL on prod):
  *   e2e_secret            — required shared secret (matches X-E2E-Secret header)
- *   e2e_default_password  — password set on bootstrapped accounts
+ *   e2e_default_password  — password set on the account at (re)registration
  *   e2e_bike_id           — bike UUID used for post-choose_bike target states
+ *   e2e_reges             — REGES JSON used to seed the staged invite + PII.
+ *                           Stored as a JSON ARRAY of RegesRecord (same shape
+ *                           as a raport.json export); the first record is used.
+ *                           Contains a valid-format Romanian CNP, so the value
+ *                           never lives in source — local is loaded from
+ *                           scripts/dev/assets/e2e-reges.json (gitignored) via
+ *                           setup-e2e-vault.sh, prod is set manually in the
+ *                           dashboard SQL editor.
  *
- * Managed accounts (all @mobipass.test, auto-provisioned in the dedicated
- * E2E Test Co company):
- *   e2e-fresh    — step = choose_bike                                       (flow 1)
- *   e2e-signed   — contract fully signed, step = pickup_delivery, HR signed  (flow 2)
- *   e2e-main     — onboarding_status = true, step = pickup_delivery         (flows 3-6)
- *   e2e-register — invite only, no auth user                                (flow 0)
+ * REGES-ALWAYS, SINGLE-ACCOUNT MODEL
+ * ----------------------------------
+ * Every reset re-creates the one account `fodor.horatiu.alexandru@gmail.com` by
+ * SIMULATING THE REAL PIPELINE end-to-end, so the seeded state is identical to
+ * production rather than hand-faked:
+ *
+ *   1. seedRegesStaged()   — feed the REGES record loaded from Vault
+ *      (`e2e_reges`) through the SAME ingestion path bulk-create uses
+ *      (`ingestRegesArray`). Produces the staged invite + encrypted PII
+ *      exactly as a real REGES upload would.
+ *   2. registerFromStaged() — claim the staged invite (set its email) then
+ *      create the confirmed auth user, so handle_user_registration links it for
+ *      real: profile (company), employee role, bike_benefit, and
+ *      employee_pii.user_id (trigger step 4.5).
+ *   3. resetTo<state>()    — change ONLY the dynamic state (bike_benefits step /
+ *      contract / order / onboarding_status, and the app-collected PII extras
+ *      for the completed dashboard). The REGES identity PII is never rebuilt —
+ *      same employee data every time, only status changes per the flow's YAML.
+ *
+ * The `reges_pending` target stops after step 1 (staged, no auth user) so the
+ * Maestro register flow can perform the real claim+OTP itself.
+ *
+ * Environment-agnostic: the gmail company is resolved by email_domain, so the
+ * same function works against the local seed and prod.
  */
 
-const TEST_DOMAIN           = "mobipass.test"
-const E2E_COMPANY_NAME      = "E2E Test Co"
+// ─── The one company + one account ────────────────────────────────────────────
+
+// Resolved at runtime by this domain (unique per the companies_email_domain
+// index). Local seed id is 44444444-…; prod's is DB-generated — never matched.
+const COMPANY_DOMAIN        = "gmail.com"
+// Named pattern from public.email_pattern_kind. Resolves to
+// "{last}?{.{middle}}.{first}" → fodor.horatiu.alexandru@gmail.com.
+const COMPANY_EMAIL_PATTERN = "last_middle_first" as EmailPatternKind
 const E2E_ESIG_TEMPLATE_ID  = "6c9db750-f9f9-4f63-8a98-ada842cbc5bd"
 
 // Fake HR-set office address used by AddressSetup's Work row and by any
-// dashboard route estimation that reads Company.address. Real-looking
-// Cluj coordinates so downstream Mapbox/route calls behave realistically.
+// dashboard route estimation that reads Company.address. Real Cluj coords so
+// downstream Mapbox/route calls behave realistically.
 const E2E_COMPANY_ADDRESS   = "Strada Avram Iancu 22, Cluj-Napoca 400117"
 const E2E_COMPANY_LAT       = 46.7693
 const E2E_COMPANY_LON       = 23.5893
 
-// Fake employee home address (also Cluj) used to seed encrypted PII for the
-// dashboard-main / ebike-catalog / profile flows. ~2 km from the office so
-// distance/route widgets render meaningful values.
-const E2E_HOME_ADDRESS      = "Strada Memorandumului 28, Cluj-Napoca 400114"
-const E2E_HOME_LAT          = 46.7711
-const E2E_HOME_LON          = 23.5712
+const ACCOUNT_EMAIL         = "fodor.horatiu.alexandru@gmail.com"
 
-// Stable PII fixture for `completed_with_address` — populated so
-// get-employee-details returns a fully-formed `pii` block.
-const E2E_PII_NATIONAL_ID   = "1900101123456"
-const E2E_PII_DATE_OF_BIRTH = "1990-01-01"
-const REGES_GMAIL_COMPANY_ID = "44444444-4444-4444-4444-444444444444"
-const REGES_GMAIL_DOMAIN     = "gmail.com"
-// Named pattern from public.email_pattern_kind. Resolves to "{last}?{.{middle}}.{first}".
-// HR notation: {last}.{middle?}.{first}@domain — middle + its leading dot are optional.
-const REGES_EMAIL_PATTERN    = "last_middle_first"
-const E2E_REGES_SOURCE_REF   = "reges-fodor-e2e"
-const E2E_REGES_DOB          = "1990-03-15"
-const E2E_REGES_DERIVED_EMAIL = "fodor.horatiu.alexandru@gmail.com"
-const E2E_REGES_CNP          = "1900315120017"
+// Home coords for the REGES `adresa`. The record itself only carries a string
+// address; these are real Cluj coords near Strada Eroilor so distance/route
+// widgets render meaningful values once the address is set during onboarding.
+const E2E_HOME_LAT          = 46.7691
+const E2E_HOME_LON          = 23.5847
+
+// App-collected extras (not in REGES; entered by the employee during
+// onboarding). Added to the completed dashboard state only.
 const E2E_PII_PHONE         = "+40712345678"
 const E2E_PII_SALARY_GROSS  = 6000
 
-type AccountKey = "fresh" | "signed" | "main" | "register" | "reges"
-
-const ACCOUNTS: Record<AccountKey, { email: string; firstName: string; lastName: string }> = {
-  fresh:    { email: `e2e-fresh@${TEST_DOMAIN}`,    firstName: "E2E", lastName: "Fresh" },
-  signed:   { email: `e2e-signed@${TEST_DOMAIN}`,   firstName: "E2E", lastName: "Signed" },
-  main:     { email: `e2e-main@${TEST_DOMAIN}`,     firstName: "E2E", lastName: "Main" },
-  register: { email: `e2e-register@${TEST_DOMAIN}`, firstName: "E2E", lastName: "Register" },
-  reges:    { email: "fodor.horatiu.alexandru@gmail.com", firstName: "Alexandru", lastName: "Fodor" },
-}
-
 type FlowTarget =
-  | "pre_register"
-  | "register"
+  | "reges_pending"
   | "fresh"
   | "pickup_ready_no_address"
   | "completed_no_address"
   | "completed_with_address"
 
-const FLOWS: Record<string, { accounts: AccountKey[]; target: FlowTarget }> = {
-  "registration":                    { accounts: ["register"], target: "pre_register" },
-  "reges-claim-register":            { accounts: ["reges"],    target: "register" },
-  "onboarding-1-to-4":               { accounts: ["fresh"],    target: "fresh" },
-  "onboarding-step-5":               { accounts: ["signed"],   target: "pickup_ready_no_address" },
-  "onboarding-step-5-to-dashboard":  { accounts: ["signed"],   target: "pickup_ready_no_address" },
-  "address-to-dashboard":            { accounts: ["main"],     target: "completed_no_address" },
-  "dashboard-main":                  { accounts: ["main"],     target: "completed_with_address" },
-  "ebike-catalog":                   { accounts: ["main"],     target: "completed_with_address" },
-  "profile":                         { accounts: ["main"],     target: "completed_with_address" },
+const FLOWS: Record<string, FlowTarget> = {
+  "registration":                    "reges_pending",
+  "reges-claim-register":            "reges_pending",
+  "reges-claim-bad-email":           "reges_pending",
+  "onboarding-1-to-4":               "fresh",
+  "onboarding-step-5":               "pickup_ready_no_address",
+  "onboarding-step-5-to-dashboard":  "pickup_ready_no_address",
+  "address-to-dashboard":            "completed_no_address",
+  "dashboard-main":                  "completed_with_address",
+  "ebike-catalog":                   "completed_with_address",
+  "profile":                         "completed_with_address",
 }
 
 // ─── Server-side env & Vault ────────────────────────────────────────────────
@@ -114,11 +131,43 @@ async function getVaultSecret(name: string): Promise<string | null> {
 let E2E_SECRET       = ""
 let DEFAULT_PASSWORD = ""
 let BIKE_ID          = ""
+let REGES_RECORD: RegesRecord | null = null
+let REGES_SOURCE_REF = ""
 
+// Vault-first, Edge-Function-env fallback. Local sets Postgres Vault secrets
+// (scripts/setup-e2e-vault.sh via docker psql); prod can instead use
+// `supabase secrets set E2E_SECRET=… E2E_DEFAULT_PASSWORD=… E2E_BIKE_ID=…`,
+// which needs only the access token (no prod DB credentials).
+//
+// e2e_reges is a JSON ARRAY string (matches a raport.json export); we use the
+// first record. Kept out of code/env to avoid leaking the CNP via source — the
+// env fallback exists only so tests can inject a synthetic record.
 async function loadSecrets(): Promise<void> {
-  E2E_SECRET       = (await getVaultSecret("e2e_secret")) ?? ""
-  DEFAULT_PASSWORD = (await getVaultSecret("e2e_default_password")) ?? ""
-  BIKE_ID          = (await getVaultSecret("e2e_bike_id")) ?? ""
+  E2E_SECRET       = (await getVaultSecret("e2e_secret"))           ?? Deno.env.get("E2E_SECRET")           ?? ""
+  DEFAULT_PASSWORD = (await getVaultSecret("e2e_default_password")) ?? Deno.env.get("E2E_DEFAULT_PASSWORD") ?? ""
+  BIKE_ID          = (await getVaultSecret("e2e_bike_id"))          ?? Deno.env.get("E2E_BIKE_ID")          ?? ""
+
+  const regesJson = (await getVaultSecret("e2e_reges")) ?? Deno.env.get("E2E_REGES") ?? ""
+  if (regesJson) {
+    let parsed: unknown
+    try {
+      parsed = JSON.parse(regesJson)
+    } catch (err) {
+      throw new Error(`e2e_reges is not valid JSON: ${(err as Error).message}`)
+    }
+    const record = Array.isArray(parsed) ? parsed[0] : parsed
+    if (!record || typeof record !== "object") {
+      throw new Error("e2e_reges must be a RegesRecord (or array with one)")
+    }
+    REGES_RECORD     = record as RegesRecord
+    REGES_SOURCE_REF = REGES_RECORD.referintaSalariat?.id ?? ""
+    if (!REGES_SOURCE_REF) {
+      throw new Error("e2e_reges record missing referintaSalariat.id")
+    }
+  } else {
+    REGES_RECORD     = null
+    REGES_SOURCE_REF = ""
+  }
 }
 
 // ─── HTTP helpers ────────────────────────────────────────────────────────────
@@ -154,29 +203,13 @@ async function patch(table: string, filter: string, row: Record<string, unknown>
   await rest("PATCH", `/rest/v1/${table}?${filter}`, row, "return=minimal")
 }
 
-async function upsertInvite(email: string, companyId: string, firstName: string, lastName: string): Promise<void> {
-  // Can't use PostgREST's on_conflict=email — the unique constraint was
-  // replaced with a partial unique index on lower(email) (REGES bridge
-  // migration) so emails can be NULL. PostgREST's on_conflict only targets
-  // real unique constraints, not partial indexes. Lookup-then-write instead.
-  const row = { email, company_id: companyId, first_name: firstName, last_name: lastName, status: "active" }
-  const existing = await rest("GET",
-    `/rest/v1/profile_invites?email=eq.${encodeURIComponent(email)}&select=id`)
-  const rows = await existing.json() as { id: string }[]
-  if (rows.length > 0) {
-    await patch("profile_invites", `id=eq.${rows[0].id}`, row)
-  } else {
-    await rest("POST", `/rest/v1/profile_invites`, row, "return=minimal")
-  }
-}
-
 // ─── Auth admin helpers ──────────────────────────────────────────────────────
 
 type AuthUser = { id: string; email: string }
 
 async function getAuthUserByEmail(email: string): Promise<AuthUser | null> {
   // GoTrue admin list endpoint does NOT support server-side email filtering —
-  // paginate and match client-side. Safe for E2E usage (test accounts only).
+  // paginate and match client-side. Safe for E2E usage (test account only).
   const target = email.toLowerCase()
   const per = 1000
   for (let page = 1; page <= 100; page++) {
@@ -193,7 +226,7 @@ async function getAuthUserByEmail(email: string): Promise<AuthUser | null> {
 async function createAuthUser(email: string, password: string): Promise<AuthUser> {
   // Two-phase to mirror real OTP → CompleteRegister flow, so the
   // handle_user_registration trigger's on_auth_user_updated branch fires
-  // (which creates profile + user_roles + bike_benefit).
+  // (which creates profile + user_roles + bike_benefit, and links REGES PII).
   //
   // Phase 1: create confirmed user without password.
   const createRes = await rest("POST", `/auth/v1/admin/users`, {
@@ -211,160 +244,128 @@ async function deleteAuthUser(userId: string): Promise<void> {
   await rest("DELETE", `/auth/v1/admin/users/${userId}`)
 }
 
-// ─── Company & account setup ────────────────────────────────────────────────
+// ─── Company setup ────────────────────────────────────────────────────────────
 
+/**
+ * Ensure the gmail company exists and carries every field the E2E flows need.
+ * Resolved by email_domain (unique), so it works on local seed + prod alike.
+ */
 async function ensureCompany(): Promise<string> {
   const existing = await getOne<{
     id: string
+    email_domain: string | null
+    email_pattern: string | null
     esignatures_template_id: string | null
     address: string | null
     address_lat: number | null
     address_lon: number | null
   }>(
     "companies",
-    `name=eq.${encodeURIComponent(E2E_COMPANY_NAME)}`,
-    "id,esignatures_template_id,address,address_lat,address_lon",
+    `email_domain=eq.${COMPANY_DOMAIN}`,
+    "id,email_domain,email_pattern,esignatures_template_id,address,address_lat,address_lon",
   )
-  if (existing) {
-    // Backfill any fields missing on rows created before they were added here.
-    const backfill: Record<string, unknown> = {}
-    if (existing.esignatures_template_id !== E2E_ESIG_TEMPLATE_ID) {
-      backfill.esignatures_template_id = E2E_ESIG_TEMPLATE_ID
-    }
-    if (existing.address !== E2E_COMPANY_ADDRESS) backfill.address     = E2E_COMPANY_ADDRESS
-    if (existing.address_lat !== E2E_COMPANY_LAT) backfill.address_lat = E2E_COMPANY_LAT
-    if (existing.address_lon !== E2E_COMPANY_LON) backfill.address_lon = E2E_COMPANY_LON
-    if (Object.keys(backfill).length > 0) {
-      await patch("companies", `id=eq.${existing.id}`, backfill)
-    }
-    console.log(`[e2e-seed] using existing company id=${existing.id}`)
-    return existing.id
+  if (!existing) {
+    throw new Error(
+      `No company with email_domain=${COMPANY_DOMAIN} found — ` +
+        `run supabase db reset (local) or create the gmail company (prod)`,
+    )
   }
-
-  const res = await rest("POST", `/rest/v1/companies`, {
-    name: E2E_COMPANY_NAME,
-    description: "Dedicated company for Maestro E2E flows — do not attach real users.",
-    monthly_benefit_subsidy: 72.00,
-    contract_months: 36,
-    currency: "RON",
-    days_in_office: 5,
-    esignatures_template_id: E2E_ESIG_TEMPLATE_ID,
-    address:     E2E_COMPANY_ADDRESS,
-    address_lat: E2E_COMPANY_LAT,
-    address_lon: E2E_COMPANY_LON,
-  }, "return=representation")
-  const rows = await res.json() as { id: string }[]
-  if (!rows[0]?.id) throw new Error(`companies insert returned no row: ${JSON.stringify(rows)}`)
-  console.log(`[e2e-seed] created company id=${rows[0].id}`)
-  return rows[0].id
+  // Backfill any field missing on rows created before it was added here.
+  const backfill: Record<string, unknown> = {}
+  if (existing.email_domain  !== COMPANY_DOMAIN)        backfill.email_domain  = COMPANY_DOMAIN
+  if (existing.email_pattern !== COMPANY_EMAIL_PATTERN) backfill.email_pattern = COMPANY_EMAIL_PATTERN
+  if (existing.esignatures_template_id !== E2E_ESIG_TEMPLATE_ID) {
+    backfill.esignatures_template_id = E2E_ESIG_TEMPLATE_ID
+  }
+  if (existing.address     !== E2E_COMPANY_ADDRESS) backfill.address     = E2E_COMPANY_ADDRESS
+  if (existing.address_lat !== E2E_COMPANY_LAT)     backfill.address_lat = E2E_COMPANY_LAT
+  if (existing.address_lon !== E2E_COMPANY_LON)     backfill.address_lon = E2E_COMPANY_LON
+  if (Object.keys(backfill).length > 0) {
+    await patch("companies", `id=eq.${existing.id}`, backfill)
+  }
+  return existing.id
 }
 
-async function ensureAccount(acct: AccountKey, companyId: string): Promise<string> {
-  const { email, firstName, lastName } = ACCOUNTS[acct]
-  await upsertInvite(email, companyId, firstName, lastName)
+// ─── Teardown ─────────────────────────────────────────────────────────────────
 
-  let user = await getAuthUserByEmail(email)
+/**
+ * Full teardown of the auth user + everything it owns, the claimed invite, and
+ * the staged REGES invite/PII for the fodor source ref. Run at the start of
+ * every reset so each flow re-simulates from a clean slate: a fresh REGES
+ * upload, then (for non-register targets) a fresh registration.
+ */
+async function deleteAccount(companyId: string): Promise<void> {
+  const user = await getAuthUserByEmail(ACCOUNT_EMAIL)
   if (user) {
-    console.log(`[e2e-seed] reused auth user ${email} id=${user.id}`)
-  } else {
-    if (!DEFAULT_PASSWORD) throw new Error("e2e_default_password Vault secret not set")
-    user = await createAuthUser(email, DEFAULT_PASSWORD)
-    if (!user?.id) throw new Error(`createAuthUser returned no id for ${email}`)
-    console.log(`[e2e-seed] created auth user ${email} id=${user.id}`)
-    // handle_user_registration trigger fires here — creates profile, user_roles, bike_benefit.
+    await del("contracts",     `user_id=eq.${user.id}`)
+    await del("bike_orders",   `user_id=eq.${user.id}`)
+    await del("bike_benefits", `user_id=eq.${user.id}`)
+    await del("employee_pii",  `user_id=eq.${user.id}`)
+    await del("user_roles",    `user_id=eq.${user.id}`)
+    await del("profiles",      `user_id=eq.${user.id}`)
+    await deleteAuthUser(user.id)
   }
+  // The staged/claimed REGES invite (and its PII) are keyed by source_ref; the
+  // invite's email may be NULL (staged) or set (claimed) — clear by source_ref.
+  await del("employee_pii",
+    `company_id=eq.${companyId}&source=eq.reges&source_ref_id=eq.${REGES_SOURCE_REF}`)
+  await del("profile_invites",
+    `company_id=eq.${companyId}&source=eq.reges&source_ref_id=eq.${REGES_SOURCE_REF}`)
+  // Also drop any invite already holding this email (a claimed REGES invite, or
+  // a stale manual one from a prior run) so re-claiming it can't collide with
+  // the partial unique index on lower(email).
+  await del("profile_invites", `email=eq.${encodeURIComponent(ACCOUNT_EMAIL)}`)
+}
+
+// ─── REGES seed + simulated registration ───────────────────────────────────────
+
+/**
+ * Seed the staged REGES record (invite + encrypted PII, email NULL, user_id
+ * NULL) by running the fodor record through the SAME ingestion bulk-create
+ * uses. Guarantees parity with a real REGES upload.
+ */
+async function seedRegesStaged(companyId: string): Promise<void> {
+  if (!REGES_RECORD) throw new Error("e2e_reges not set (Vault or env)")
+  const db = makeRestClient(SUPABASE_URL, SERVICE_ROLE_KEY)
+  const ctx: CompanyCtx = {
+    id:            companyId,
+    email_domain:  COMPANY_DOMAIN,
+    email_pattern: COMPANY_EMAIL_PATTERN,
+  }
+  const results = await ingestRegesArray(db, ctx, [REGES_RECORD])
+  const r = results[0]
+  if (!r || r.status === "failed") {
+    throw new Error(`seedRegesStaged: ingest failed: ${JSON.stringify(r)}`)
+  }
+}
+
+/**
+ * Simulate the real /register claim + OTP signup against the staged record:
+ * claim the staged invite (set its email) then create the confirmed auth user.
+ * handle_user_registration then does the real linking — profile (company),
+ * employee role, bike_benefit, and employee_pii.user_id (trigger step 4.5).
+ * Returns the new user id.
+ */
+async function registerFromStaged(companyId: string): Promise<string> {
+  // Claim: the /register edge function sets the staged invite's email before
+  // signup; the registration trigger resolves the invite by email.
+  await patch("profile_invites",
+    `company_id=eq.${companyId}&source=eq.reges&source_ref_id=eq.${REGES_SOURCE_REF}`,
+    { email: ACCOUNT_EMAIL })
+  if (!DEFAULT_PASSWORD) throw new Error("e2e_default_password not set (Vault or env)")
+  const user = await createAuthUser(ACCOUNT_EMAIL, DEFAULT_PASSWORD)
+  if (!user?.id) throw new Error(`createAuthUser returned no id for ${ACCOUNT_EMAIL}`)
   return user.id
 }
 
-async function deleteAccountIfExists(acct: AccountKey): Promise<void> {
-  const { email } = ACCOUNTS[acct]
-  const user = await getAuthUserByEmail(email)
-  if (!user) return
-  await del("contracts",     `user_id=eq.${user.id}`)
-  await del("bike_orders",   `user_id=eq.${user.id}`)
-  await del("bike_benefits", `user_id=eq.${user.id}`)
-  await del("employee_pii",  `user_id=eq.${user.id}`)
-  await del("user_roles",    `user_id=eq.${user.id}`)
-  await del("profiles",      `user_id=eq.${user.id}`)
-  await patch("profile_invites", `email=eq.${encodeURIComponent(email)}`, { user_id: null })
-  await deleteAuthUser(user.id)
-}
-
 // ─── Target state appliers ──────────────────────────────────────────────────
-
-async function ensureRegesGmailCompany(): Promise<string> {
-  const existing = await getOne<{ id: string }>(
-    "companies",
-    `id=eq.${REGES_GMAIL_COMPANY_ID}`,
-    "id",
-  )
-  if (existing?.id) {
-    await patch("companies", `id=eq.${existing.id}`, {
-      email_domain:  REGES_GMAIL_DOMAIN,
-      email_pattern: REGES_EMAIL_PATTERN,
-    })
-    return existing.id
-  }
-  throw new Error(
-    `RegesGmail company ${REGES_GMAIL_COMPANY_ID} not found — run supabase db reset`,
-  )
-}
-
-/** Pending REGES invite + PII for Maestro reges-claim-register (no auth user). */
-async function resetToRegesPending(companyId: string): Promise<void> {
-  const db = makeRestClient(SUPABASE_URL, SERVICE_ROLE_KEY)
-
-  await patch("companies", `id=eq.${companyId}`, {
-    email_domain:  REGES_GMAIL_DOMAIN,
-    email_pattern: REGES_EMAIL_PATTERN,
-  })
-
-  await del("employee_pii",
-    `company_id=eq.${companyId}&source=eq.reges&source_ref_id=eq.${E2E_REGES_SOURCE_REF}`)
-  await del("profile_invites",
-    `company_id=eq.${companyId}&source=eq.reges&source_ref_id=eq.${E2E_REGES_SOURCE_REF}`)
-
-  const dobHash = await birthDateHash(db, E2E_REGES_DOB)
-  const [nationalIdEnc, dobEnc] = await Promise.all([
-    encrypt(db, E2E_REGES_CNP),
-    encrypt(db, E2E_REGES_DOB),
-  ])
-
-  const inviteRes = await rest("POST", `/rest/v1/profile_invites`, {
-    company_id:      companyId,
-    email:           null,
-    source:          "reges",
-    source_ref_id:   E2E_REGES_SOURCE_REF,
-    first_name:      "ALEXANDRU-HORATIU",
-    last_name:       "FODOR",
-    birth_date_hash: dobHash,
-    derived_email:   E2E_REGES_DERIVED_EMAIL,
-    radiat:          false,
-    status:          "active",
-  }, "return=representation")
-  const invite = (await inviteRes.json() as { id: string }[])[0]
-  if (!invite?.id) throw new Error("profile_invites insert returned no row")
-
-  await rest("POST", `/rest/v1/employee_pii`, {
-    company_id:              companyId,
-    profile_invite_id:       invite.id,
-    source:                  "reges",
-    source_ref_id:           E2E_REGES_SOURCE_REF,
-    user_id:                 null,
-    national_id_encrypted:   nationalIdEnc,
-    date_of_birth_encrypted: dobEnc,
-    country:                 "RO",
-    nationality_iso:         "RO",
-    country_of_domicile_iso: "RO",
-    id_document_type:        "national_id",
-  }, "return=minimal")
-}
+// These change ONLY the dynamic state. The REGES identity PII linked at
+// registration is preserved (never deleted) — same employee data every reset.
 
 async function resetToFresh(userId: string): Promise<void> {
   await del("contracts",     `user_id=eq.${userId}`)
   await del("bike_orders",   `user_id=eq.${userId}`)
   await del("bike_benefits", `user_id=eq.${userId}`)
-  await del("employee_pii",  `user_id=eq.${userId}`)
   await rest("POST", `/rest/v1/bike_benefits`,
     { user_id: userId, step: "choose_bike" }, "return=minimal")
   await patch("profiles", `user_id=eq.${userId}`, { onboarding_status: false })
@@ -372,23 +373,22 @@ async function resetToFresh(userId: string): Promise<void> {
 
 /**
  * Step 5 (pickup_delivery) ready to confirm — both parties have signed,
- * contract is approved, but delivered_at is NULL and employee_pii is missing.
+ * contract is approved, delivered_at is NULL.
  *
  * UI expectations:
  *   - contract_employer_signed_at non-null → PickupDeliveryCard's
  *     "Confirm eBike pickup" button is enabled (isHrSigned == true).
  *   - delivered_at null + onboarding_status false → user stays on the
  *     OnboardingDashboard at step 5 on launch.
- *   - No employee_pii row → after tapping confirm, performStepAction runs
- *     refreshProfileAndNavigateHome() which routes to Screen.AddressSetup
- *     (getHomeScreen guard: homeAddress null || homeLat null || homeLon null).
+ *   - employee_pii has the REGES home address but home_lat/home_lon are NULL →
+ *     after tapping confirm, refreshProfileAndNavigateHome() routes to
+ *     Screen.AddressSetup (getHomeScreen guard fires on null lat/lon).
  */
 async function resetToPickupReadyNoAddress(userId: string, companyId: string): Promise<void> {
   if (!BIKE_ID) throw new Error("E2E_BIKE_ID not set")
   await del("contracts",     `user_id=eq.${userId}`)
   await del("bike_orders",   `user_id=eq.${userId}`)
   await del("bike_benefits", `user_id=eq.${userId}`)
-  await del("employee_pii",  `user_id=eq.${userId}`)
 
   const now = new Date().toISOString()
   const benefitRes = await rest("POST", `/rest/v1/bike_benefits`, {
@@ -428,7 +428,6 @@ async function resetToCompleted(userId: string, companyId: string, withAddress: 
   await del("contracts",     `user_id=eq.${userId}`)
   await del("bike_orders",   `user_id=eq.${userId}`)
   await del("bike_benefits", `user_id=eq.${userId}`)
-  await del("employee_pii",  `user_id=eq.${userId}`)
 
   const now = new Date().toISOString()
   const benefitRes = await rest("POST", `/rest/v1/bike_benefits`, {
@@ -463,97 +462,65 @@ async function resetToCompleted(userId: string, companyId: string, withAddress: 
   await patch("profiles", `user_id=eq.${userId}`, { onboarding_status: true })
 
   if (withAddress) {
-    // Encrypt the Cluj-Napoca fixture with the same Vault/env key
-    // update-employee-pii uses, so get-employee-details can decrypt it back.
+    // Enrich the REGES-linked PII row with the app-collected fields the
+    // employee would enter during onboarding (home coords for routing, phone,
+    // salary). Identity fields (CNP/DOB/home address/country/id doc) are
+    // already present from the REGES ingest — we only add the extras here.
     const db = makeRestClient(SUPABASE_URL, SERVICE_ROLE_KEY)
-    const [
-      nationalIdEnc,
-      dobEnc,
-      phoneEnc,
-      homeAddressEnc,
-      homeLatEnc,
-      homeLonEnc,
-      salaryGrossEnc,
-    ] = await Promise.all([
-      encrypt(db, E2E_PII_NATIONAL_ID),
-      encrypt(db, E2E_PII_DATE_OF_BIRTH),
+    const [phoneEnc, homeLatEnc, homeLonEnc, salaryGrossEnc] = await Promise.all([
       encrypt(db, E2E_PII_PHONE),
-      encrypt(db, E2E_HOME_ADDRESS),
       encrypt(db, String(E2E_HOME_LAT)),
       encrypt(db, String(E2E_HOME_LON)),
       encrypt(db, String(E2E_PII_SALARY_GROSS)),
     ])
-
-    await rest("POST", `/rest/v1/employee_pii`, {
-      user_id: userId,
-      company_id: companyId,
-      national_id_encrypted:   nationalIdEnc,
-      date_of_birth_encrypted: dobEnc,
-      phone_encrypted:         phoneEnc,
-      home_address_encrypted:  homeAddressEnc,
-      home_lat_encrypted:      homeLatEnc,
-      home_lon_encrypted:      homeLonEnc,
-      salary_gross_encrypted:  salaryGrossEnc,
-      country:                 "RO",
-      nationality_iso:         "RO",
-      country_of_domicile_iso: "RO",
-      id_document_type:        "national_id",
-      salary_currency:         "RON",
-      education_level:         "bachelor",
-    }, "return=minimal")
+    await patch("employee_pii", `user_id=eq.${userId}`, {
+      phone_encrypted:        phoneEnc,
+      home_lat_encrypted:     homeLatEnc,
+      home_lon_encrypted:     homeLonEnc,
+      salary_gross_encrypted: salaryGrossEnc,
+      salary_currency:        "RON",
+      education_level:        "bachelor",
+    })
+    void companyId
   }
 }
 
 // ─── Commands ────────────────────────────────────────────────────────────────
 
-async function bootstrap(): Promise<Record<string, unknown>> {
-  const companyId = await ensureCompany()
-  const result: Record<string, string> = { company_id: companyId }
-  for (const acct of Object.keys(ACCOUNTS) as AccountKey[]) {
-    if (acct === "register") {
-      await upsertInvite(ACCOUNTS[acct].email, companyId, ACCOUNTS[acct].firstName, ACCOUNTS[acct].lastName)
-      result[ACCOUNTS[acct].email] = "invite-only"
-      continue
-    }
-    const uid = await ensureAccount(acct, companyId)
-    result[ACCOUNTS[acct].email] = uid
+/** Apply one flow target to the single account. Shared by reset() + bootstrap(). */
+async function applyTarget(target: FlowTarget, companyId: string): Promise<void> {
+  await deleteAccount(companyId)
+  await seedRegesStaged(companyId)
+  // reges_pending stops here — staged invite + PII, no auth user — so the
+  // Maestro register flow performs the real claim + OTP signup itself.
+  if (target === "reges_pending") return
+
+  const uid = await registerFromStaged(companyId)
+  switch (target) {
+    case "fresh":                    await resetToFresh(uid); break
+    case "pickup_ready_no_address":  await resetToPickupReadyNoAddress(uid, companyId); break
+    case "completed_no_address":     await resetToCompleted(uid, companyId, false); break
+    case "completed_with_address":   await resetToCompleted(uid, companyId, true); break
   }
-  return { ok: true, bootstrap: result }
+}
+
+async function bootstrap(): Promise<Record<string, unknown>> {
+  // Ensure the company exists and leave the account in the reges_pending state
+  // so a fresh bootstrap is immediately ready for the register flow; every
+  // other flow resets it to its own target on run.
+  const companyId = await ensureCompany()
+  await applyTarget("reges_pending", companyId)
+  return { ok: true, company_id: companyId, account: ACCOUNT_EMAIL, state: "reges_pending" }
 }
 
 async function reset(flowName: string): Promise<Record<string, unknown>> {
-  const spec = FLOWS[flowName]
-  if (!spec) {
+  const target = FLOWS[flowName]
+  if (!target) {
     return { ok: false, error: `unknown flow`, known: Object.keys(FLOWS) }
   }
   const companyId = await ensureCompany()
-  const result: Record<string, string> = {}
-
-  for (const acct of spec.accounts) {
-    if (spec.target === "pre_register") {
-      await deleteAccountIfExists(acct)
-      await upsertInvite(ACCOUNTS[acct].email, companyId, ACCOUNTS[acct].firstName, ACCOUNTS[acct].lastName)
-      result[ACCOUNTS[acct].email] = "pre_register"
-      continue
-    }
-    if (spec.target === "register") {
-      const regesCompanyId = await ensureRegesGmailCompany()
-      await deleteAccountIfExists(acct)
-      await del("profile_invites", `email=eq.${encodeURIComponent(ACCOUNTS[acct].email)}`)
-      await resetToRegesPending(regesCompanyId)
-      result[ACCOUNTS[acct].email] = "register"
-      continue
-    }
-    const uid = await ensureAccount(acct, companyId)
-    switch (spec.target) {
-      case "fresh":                    await resetToFresh(uid); break
-      case "pickup_ready_no_address":  await resetToPickupReadyNoAddress(uid, companyId); break
-      case "completed_no_address":     await resetToCompleted(uid, companyId, false); break
-      case "completed_with_address":   await resetToCompleted(uid, companyId, true); break
-    }
-    result[ACCOUNTS[acct].email] = spec.target
-  }
-  return { ok: true, flow: flowName, target: spec.target, accounts: result }
+  await applyTarget(target, companyId)
+  return { ok: true, flow: flowName, target, account: ACCOUNT_EMAIL }
 }
 
 // ─── Handler ─────────────────────────────────────────────────────────────────

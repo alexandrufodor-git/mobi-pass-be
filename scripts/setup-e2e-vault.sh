@@ -138,25 +138,49 @@ if [[ "$TARGET" == "prod" ]]; then
   supabase functions deploy e2e-seed --no-verify-jwt
   supabase functions deploy e2e-otp  --no-verify-jwt
   echo
-  echo "✓ deployed. Prod Vault + bootstrap are manual — see the recipe below."
+  echo "✓ deployed. Prod Vault is set manually via the dashboard SQL editor."
+
+  SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+  REGES_JSON_FILE="$SCRIPT_DIR/../scripts/dev/assets/e2e-reges.json"
+  # Tolerate either layout (script lives in scripts/, but caller cwd may vary).
+  if [[ ! -f "$REGES_JSON_FILE" ]]; then
+    REGES_JSON_FILE="$(cd "$SCRIPT_DIR/.." && pwd)/scripts/dev/assets/e2e-reges.json"
+  fi
+
   cat <<EOF
 
-═══ Prod recipe (manual steps after deploy) ═══
+═══ Prod recipe ═══
 
-1. Dashboard SQL editor (set Vault secrets):
-   SELECT vault.create_secret('<E2E_SECRET>',           'e2e_secret');
-   SELECT vault.create_secret('<E2E_DEFAULT_PASSWORD>', 'e2e_default_password');
-   SELECT vault.create_secret('<E2E_BIKE_ID_UUID>',     'e2e_bike_id');
+e2e_secret / e2e_default_password / e2e_bike_id are usually already set from a
+previous run; only re-do them when rotating. The Maestro-side env file
+(testing/maestro/.env.local) MUST hold the same E2E_SECRET / E2E_DEFAULT_PASSWORD
+values that are in prod Vault — that's the #1 source of invalid_credentials.
 
-2. Bootstrap accounts:
-   curl -sS -X POST "\$SUPABASE_URL/functions/v1/e2e-seed" \\
-     -H "X-E2E-Secret: \$E2E_SECRET" \\
-     -H "Content-Type: application/json" \\
+For e2e_reges (the one new secret in this refactor), paste THIS into the
+dashboard SQL editor (uses dollar-quoting so the JSON's quotes don't fight
+SQL's quoting):
+
+EOF
+  if [[ -f "$REGES_JSON_FILE" ]]; then
+    printf "SELECT vault.create_secret(\$EREGES\$"
+    cat "$REGES_JSON_FILE"
+    printf "\$EREGES\$, 'e2e_reges');\n\n"
+  else
+    echo "(scripts/dev/assets/e2e-reges.json missing — paste the JSON array yourself)"
+    echo "SELECT vault.create_secret(\$EREGES\$[ … paste from raport.json … ]\$EREGES\$, 'e2e_reges');"
+    echo
+  fi
+
+  cat <<'EOF'
+To rotate ANY secret later:
+   DELETE FROM vault.secrets WHERE name = 'e2e_reges';
+   SELECT vault.create_secret($EREGES$<new value>$EREGES$, 'e2e_reges');
+
+Re-bootstrap (only needed when rotating e2e_secret or wiping state):
+   curl -sS -X POST "$SUPABASE_URL/functions/v1/e2e-seed" \
+     -H "X-E2E-Secret: $E2E_SECRET" \
+     -H "Content-Type: application/json" \
      -d '{"command":"bootstrap"}'
-
-To rotate secrets:
-   DELETE FROM vault.secrets WHERE name = 'e2e_secret';
-   SELECT vault.create_secret('<new>', 'e2e_secret');
 EOF
   exit 0
 fi
@@ -213,10 +237,45 @@ upsert_secret() {
   echo "  ✓ $name"
 }
 
+# Same as upsert_secret but reads the value from stdin so it can carry newlines,
+# single quotes, etc. without shell-quoting hell. Used for the e2e_reges JSON
+# blob (potentially multi-line, contains quotes).
+upsert_secret_stdin() {
+  local name=$1
+  local value
+  value=$(cat)
+  # psql variable substitution + format() is the only quote-safe way to feed an
+  # arbitrary string into create_secret() from the shell.
+  docker exec -i "$CONTAINER" psql -U postgres \
+    -v ON_ERROR_STOP=1 \
+    -v secret_name="$name" \
+    -v secret_value="$value" <<'SQL' > /dev/null
+DELETE FROM vault.secrets WHERE name = :'secret_name';
+SELECT vault.create_secret(:'secret_value', :'secret_name');
+SQL
+  echo "  ✓ $name"
+}
+
+# REGES JSON used by e2e-seed/index.ts to seed the staged invite + PII.
+# Gitignored to keep the (valid-format) CNP out of source — see
+# scripts/dev/assets/e2e-reges.json comment in .gitignore.
+REGES_JSON_FILE="$REPO_DIR/scripts/dev/assets/e2e-reges.json"
+if [[ ! -f "$REGES_JSON_FILE" ]]; then
+  echo "✗ $REGES_JSON_FILE missing — see scripts/dev/assets/README or ask a teammate" >&2
+  exit 1
+fi
+# Validate it parses as a JSON array of at least one RegesRecord-ish shape.
+if ! jq -e 'if type=="array" then .[0].referintaSalariat.id and .[0].info.cnp else .referintaSalariat.id and .info.cnp end' \
+     "$REGES_JSON_FILE" > /dev/null; then
+  echo "✗ $REGES_JSON_FILE is not a valid REGES record (need referintaSalariat.id + info.cnp)" >&2
+  exit 1
+fi
+
 echo
 upsert_secret "e2e_secret"           "$SECRET"
 upsert_secret "e2e_default_password" "$PASSWORD"
 upsert_secret "e2e_bike_id"          "$BIKE_ID"
+upsert_secret_stdin "e2e_reges"     < "$REGES_JSON_FILE"
 
 docker exec "$CONTAINER" psql -U postgres -c \
   "SELECT name, LENGTH(decrypted_secret) AS len

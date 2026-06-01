@@ -16,3 +16,8 @@
 # keys). The .example template is still tracked because its filename ends in
 # .example, not .env.
 scripts/dev/*.env
+
+# REGES JSON used to seed the single E2E account (contains a valid-format
+# Romanian CNP). Loaded into local Vault by scripts/setup-e2e-vault.sh; prod
+# Vault is populated manually. Kept out of git.
+scripts/dev/assets/e2e-reges.json

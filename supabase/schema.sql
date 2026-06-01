@@ -13,13 +13,49 @@ SET client_min_messages = warning;
 SET row_security = off;
 
 
-CREATE SCHEMA IF NOT EXISTS "public";
+CREATE EXTENSION IF NOT EXISTS "pg_net" WITH SCHEMA "extensions";
 
 
-ALTER SCHEMA "public" OWNER TO "pg_database_owner";
+
+
 
 
 COMMENT ON SCHEMA "public" IS 'standard public schema';
+
+
+
+CREATE EXTENSION IF NOT EXISTS "pg_stat_statements" WITH SCHEMA "extensions";
+
+
+
+
+
+
+CREATE EXTENSION IF NOT EXISTS "pg_trgm" WITH SCHEMA "public";
+
+
+
+
+
+
+CREATE EXTENSION IF NOT EXISTS "pgcrypto" WITH SCHEMA "extensions";
+
+
+
+
+
+
+CREATE EXTENSION IF NOT EXISTS "supabase_vault" WITH SCHEMA "vault";
+
+
+
+
+
+
+CREATE EXTENSION IF NOT EXISTS "uuid-ossp" WITH SCHEMA "extensions";
+
+
+
 
 
 
@@ -500,18 +536,41 @@ CREATE OR REPLACE FUNCTION "public"."ingest_reges_batch"("p_company_id" "uuid", 
     SET "search_path" TO 'public'
     AS $$
 DECLARE
-  rec               jsonb;
-  v_invite_id       uuid;
-  v_pii_id          uuid;
-  v_invite_status   text;
-  v_pii_status      text;
-  v_was_radiat      boolean;
-  v_existing_email  text;
-  v_existing_user   uuid;
-  out_results       jsonb := '[]'::jsonb;
+  rec                jsonb;
+  v_invite_id        uuid;
+  v_pii_id           uuid;
+  v_invite_status    text;
+  v_pii_status       text;
+  v_was_radiat       boolean;
+  v_existing_email   text;
+  v_existing_user    uuid;
+  -- Pre-flight match: registered profile that already owns derived_email.
+  v_match_user       uuid;
+  v_match_pii_id     uuid;
+  out_results        jsonb := '[]'::jsonb;
 BEGIN
   FOR rec IN SELECT * FROM jsonb_array_elements(p_records)
   LOOP
+    -- 0. Pre-flight: does a registered profile already own derived_email?
+    -- Scoped to p_company_id so cross-tenant users never collide.
+    v_match_user   := NULL;
+    v_match_pii_id := NULL;
+    IF rec->>'derived_email' IS NOT NULL THEN
+      SELECT user_id INTO v_match_user
+        FROM profiles
+       WHERE company_id = p_company_id
+         AND lower(email) = lower(rec->>'derived_email')
+       LIMIT 1;
+      IF v_match_user IS NOT NULL THEN
+        -- May or may not exist; either way we want a row-level lock so a
+        -- concurrent update-employee-pii doesn't race the merge below.
+        SELECT id INTO v_match_pii_id
+          FROM employee_pii
+         WHERE user_id = v_match_user
+         FOR UPDATE;
+      END IF;
+    END IF;
+
     -- 1. profile_invites upsert (claim-aware) -----------------------------
     SELECT id, email, radiat
       INTO v_invite_id, v_existing_email, v_was_radiat
@@ -522,20 +581,34 @@ BEGIN
      FOR UPDATE;
 
     IF v_invite_id IS NULL THEN
+      -- New REGES invite. When pre-matched to a registered user, attach
+      -- directly (status='active', user_id set). Email is still left NULL
+      -- to avoid colliding with any manual invite for the same address
+      -- (the unique index on lower(email) is partial WHERE email IS NOT
+      -- NULL); linkage flows through user_id instead.
       INSERT INTO profile_invites (
         company_id, email, source, source_ref_id,
         first_name, last_name,
-        birth_date_hash, derived_email, radiat
+        birth_date_hash, derived_email, radiat,
+        status, user_id
       ) VALUES (
         p_company_id, NULL, 'reges', rec->>'source_ref_id',
         rec->>'first_name', rec->>'last_name',
         rec->>'birth_date_hash', rec->>'derived_email',
-        COALESCE((rec->>'radiat')::boolean, false)
+        COALESCE((rec->>'radiat')::boolean, false),
+        CASE WHEN v_match_user IS NOT NULL
+          THEN 'active'::user_profile_status
+          ELSE 'inactive'::user_profile_status
+        END,
+        v_match_user
       ) RETURNING id INTO v_invite_id;
-      v_invite_status := 'created';
+      v_invite_status := CASE WHEN v_match_user IS NOT NULL
+                              THEN 'created_linked'
+                              ELSE 'created'
+                          END;
 
     ELSIF v_existing_email IS NOT NULL THEN
-      -- Already claimed by a human. Surface radiat transition if it flipped.
+      -- Already claimed via OTP signup. Surface radiat transition only.
       IF COALESCE((rec->>'radiat')::boolean, false) AND NOT v_was_radiat THEN
         UPDATE profile_invites
            SET radiat = true
@@ -573,21 +646,50 @@ BEGIN
      FOR UPDATE;
 
     IF v_pii_id IS NULL THEN
-      INSERT INTO employee_pii (
-        company_id, profile_invite_id, source, source_ref_id, country,
-        national_id_encrypted, home_address_encrypted, date_of_birth_encrypted,
-        locality_code, locality_code_system,
-        nationality_iso, country_of_domicile_iso, id_document_type
-      ) VALUES (
-        p_company_id, v_invite_id, 'reges', rec->>'source_ref_id', 'RO',
-        rec->>'national_id_encrypted',
-        rec->>'home_address_encrypted',
-        rec->>'date_of_birth_encrypted',
-        rec->>'locality_code', rec->>'locality_code_system',
-        rec->>'nationality_iso', rec->>'country_of_domicile_iso',
-        rec->>'id_document_type'
-      ) RETURNING id INTO v_pii_id;
-      v_pii_status := 'created';
+      IF v_match_user IS NOT NULL AND v_match_pii_id IS NOT NULL THEN
+        -- Matched user already has a PII row (e.g. HR who entered their
+        -- own PII via update-employee-pii before the REGES upload).
+        -- The employee_pii_user_unique index forbids a second row, so MERGE:
+        -- REGES fields overwrite NULLs but keep any value the user already
+        -- set themselves (COALESCE(new, existing)).
+        UPDATE employee_pii SET
+          profile_invite_id       = v_invite_id,
+          source                  = 'reges',
+          source_ref_id           = rec->>'source_ref_id',
+          national_id_encrypted   = COALESCE(national_id_encrypted,   rec->>'national_id_encrypted'),
+          home_address_encrypted  = COALESCE(home_address_encrypted,  rec->>'home_address_encrypted'),
+          date_of_birth_encrypted = COALESCE(date_of_birth_encrypted, rec->>'date_of_birth_encrypted'),
+          locality_code           = COALESCE(locality_code,           rec->>'locality_code'),
+          locality_code_system    = COALESCE(locality_code_system,    rec->>'locality_code_system'),
+          nationality_iso         = COALESCE(nationality_iso,         rec->>'nationality_iso'),
+          country_of_domicile_iso = COALESCE(country_of_domicile_iso, rec->>'country_of_domicile_iso'),
+          id_document_type        = COALESCE(id_document_type,        rec->>'id_document_type')
+        WHERE id = v_match_pii_id
+        RETURNING id INTO v_pii_id;
+        v_pii_status := 'merged';
+      ELSE
+        -- Either no profile match (legacy staged path → user_id=NULL) or
+        -- profile matched but they have no PII row yet (direct link).
+        INSERT INTO employee_pii (
+          user_id, company_id, profile_invite_id, source, source_ref_id, country,
+          national_id_encrypted, home_address_encrypted, date_of_birth_encrypted,
+          locality_code, locality_code_system,
+          nationality_iso, country_of_domicile_iso, id_document_type
+        ) VALUES (
+          v_match_user,
+          p_company_id, v_invite_id, 'reges', rec->>'source_ref_id', 'RO',
+          rec->>'national_id_encrypted',
+          rec->>'home_address_encrypted',
+          rec->>'date_of_birth_encrypted',
+          rec->>'locality_code', rec->>'locality_code_system',
+          rec->>'nationality_iso', rec->>'country_of_domicile_iso',
+          rec->>'id_document_type'
+        ) RETURNING id INTO v_pii_id;
+        v_pii_status := CASE WHEN v_match_user IS NOT NULL
+                             THEN 'created_linked'
+                             ELSE 'created'
+                         END;
+      END IF;
 
     ELSIF v_existing_user IS NOT NULL THEN
       v_pii_status := 'skipped_claimed';
@@ -617,7 +719,8 @@ BEGIN
       v_pii_status,
       jsonb_build_object('invite_status', v_invite_status,
                          'source_ref_id', rec->>'source_ref_id',
-                         'derived_email_set', (rec->>'derived_email' IS NOT NULL)),
+                         'derived_email_set', (rec->>'derived_email' IS NOT NULL),
+                         'matched_user',   v_match_user),
       now()
     );
 
@@ -627,7 +730,8 @@ BEGIN
       'status',          v_pii_status,
       'invite_id',       v_invite_id,
       'employee_pii_id', v_pii_id,
-      'invite_status',   v_invite_status
+      'invite_status',   v_invite_status,
+      'matched_user',    v_match_user
     );
   END LOOP;
 
@@ -1082,8 +1186,9 @@ CREATE TABLE IF NOT EXISTS "public"."companies" (
     "address_lon" double precision,
     "contact_email" "text",
     "days_in_office" integer DEFAULT 5,
-    "email_domain" "text",
-    "email_pattern" "public"."email_pattern_kind"
+    "email_domain" "text" NOT NULL,
+    "email_pattern" "public"."email_pattern_kind",
+    CONSTRAINT "companies_email_domain_format" CHECK ((("email_domain" = "lower"("email_domain")) AND ("email_domain" ~ '^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$'::"text")))
 );
 
 
@@ -1114,7 +1219,7 @@ COMMENT ON COLUMN "public"."companies"."days_in_office" IS 'Number of days per w
 
 
 
-COMMENT ON COLUMN "public"."companies"."email_domain" IS 'Primary corporate email domain (e.g. "8x8.com"). Used at registration to scope claim-by-name lookup. Required before REGES upload for that company.';
+COMMENT ON COLUMN "public"."companies"."email_domain" IS 'Primary corporate email domain (e.g. "8x8.com"). Required. Used at registration to scope claim-by-name lookup and at REGES upload to derive employee emails. Bare hostname only — no scheme, no "@", lowercase.';
 
 
 
@@ -1685,7 +1790,7 @@ ALTER TABLE ONLY "public"."user_roles"
 
 
 
-CREATE UNIQUE INDEX "companies_email_domain_unique" ON "public"."companies" USING "btree" ("lower"("email_domain")) WHERE ("email_domain" IS NOT NULL);
+CREATE UNIQUE INDEX "companies_email_domain_unique" ON "public"."companies" USING "btree" ("lower"("email_domain"));
 
 
 
@@ -2239,11 +2344,196 @@ CREATE POLICY "user_roles_hr_select" ON "public"."user_roles" FOR SELECT TO "aut
 
 
 
+
+
+ALTER PUBLICATION "supabase_realtime" OWNER TO "postgres";
+
+
+
+
+
+
+ALTER PUBLICATION "supabase_realtime" ADD TABLE ONLY "public"."bike_benefits";
+
+
+
+ALTER PUBLICATION "supabase_realtime" ADD TABLE ONLY "public"."company_notifications";
+
+
+
+ALTER PUBLICATION "supabase_realtime" ADD TABLE ONLY "public"."profiles";
+
+
+
+
+
+
 GRANT USAGE ON SCHEMA "public" TO "postgres";
 GRANT USAGE ON SCHEMA "public" TO "anon";
 GRANT USAGE ON SCHEMA "public" TO "authenticated";
 GRANT USAGE ON SCHEMA "public" TO "service_role";
 GRANT USAGE ON SCHEMA "public" TO "supabase_auth_admin";
+
+
+
+GRANT ALL ON FUNCTION "public"."gtrgm_in"("cstring") TO "postgres";
+GRANT ALL ON FUNCTION "public"."gtrgm_in"("cstring") TO "anon";
+GRANT ALL ON FUNCTION "public"."gtrgm_in"("cstring") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."gtrgm_in"("cstring") TO "service_role";
+
+
+
+GRANT ALL ON FUNCTION "public"."gtrgm_out"("public"."gtrgm") TO "postgres";
+GRANT ALL ON FUNCTION "public"."gtrgm_out"("public"."gtrgm") TO "anon";
+GRANT ALL ON FUNCTION "public"."gtrgm_out"("public"."gtrgm") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."gtrgm_out"("public"."gtrgm") TO "service_role";
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 
@@ -2301,6 +2591,97 @@ GRANT ALL ON FUNCTION "public"."get_vault_secret"("secret_name" "text") TO "serv
 
 
 
+GRANT ALL ON FUNCTION "public"."gin_extract_query_trgm"("text", "internal", smallint, "internal", "internal", "internal", "internal") TO "postgres";
+GRANT ALL ON FUNCTION "public"."gin_extract_query_trgm"("text", "internal", smallint, "internal", "internal", "internal", "internal") TO "anon";
+GRANT ALL ON FUNCTION "public"."gin_extract_query_trgm"("text", "internal", smallint, "internal", "internal", "internal", "internal") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."gin_extract_query_trgm"("text", "internal", smallint, "internal", "internal", "internal", "internal") TO "service_role";
+
+
+
+GRANT ALL ON FUNCTION "public"."gin_extract_value_trgm"("text", "internal") TO "postgres";
+GRANT ALL ON FUNCTION "public"."gin_extract_value_trgm"("text", "internal") TO "anon";
+GRANT ALL ON FUNCTION "public"."gin_extract_value_trgm"("text", "internal") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."gin_extract_value_trgm"("text", "internal") TO "service_role";
+
+
+
+GRANT ALL ON FUNCTION "public"."gin_trgm_consistent"("internal", smallint, "text", integer, "internal", "internal", "internal", "internal") TO "postgres";
+GRANT ALL ON FUNCTION "public"."gin_trgm_consistent"("internal", smallint, "text", integer, "internal", "internal", "internal", "internal") TO "anon";
+GRANT ALL ON FUNCTION "public"."gin_trgm_consistent"("internal", smallint, "text", integer, "internal", "internal", "internal", "internal") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."gin_trgm_consistent"("internal", smallint, "text", integer, "internal", "internal", "internal", "internal") TO "service_role";
+
+
+
+GRANT ALL ON FUNCTION "public"."gin_trgm_triconsistent"("internal", smallint, "text", integer, "internal", "internal", "internal") TO "postgres";
+GRANT ALL ON FUNCTION "public"."gin_trgm_triconsistent"("internal", smallint, "text", integer, "internal", "internal", "internal") TO "anon";
+GRANT ALL ON FUNCTION "public"."gin_trgm_triconsistent"("internal", smallint, "text", integer, "internal", "internal", "internal") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."gin_trgm_triconsistent"("internal", smallint, "text", integer, "internal", "internal", "internal") TO "service_role";
+
+
+
+GRANT ALL ON FUNCTION "public"."gtrgm_compress"("internal") TO "postgres";
+GRANT ALL ON FUNCTION "public"."gtrgm_compress"("internal") TO "anon";
+GRANT ALL ON FUNCTION "public"."gtrgm_compress"("internal") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."gtrgm_compress"("internal") TO "service_role";
+
+
+
+GRANT ALL ON FUNCTION "public"."gtrgm_consistent"("internal", "text", smallint, "oid", "internal") TO "postgres";
+GRANT ALL ON FUNCTION "public"."gtrgm_consistent"("internal", "text", smallint, "oid", "internal") TO "anon";
+GRANT ALL ON FUNCTION "public"."gtrgm_consistent"("internal", "text", smallint, "oid", "internal") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."gtrgm_consistent"("internal", "text", smallint, "oid", "internal") TO "service_role";
+
+
+
+GRANT ALL ON FUNCTION "public"."gtrgm_decompress"("internal") TO "postgres";
+GRANT ALL ON FUNCTION "public"."gtrgm_decompress"("internal") TO "anon";
+GRANT ALL ON FUNCTION "public"."gtrgm_decompress"("internal") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."gtrgm_decompress"("internal") TO "service_role";
+
+
+
+GRANT ALL ON FUNCTION "public"."gtrgm_distance"("internal", "text", smallint, "oid", "internal") TO "postgres";
+GRANT ALL ON FUNCTION "public"."gtrgm_distance"("internal", "text", smallint, "oid", "internal") TO "anon";
+GRANT ALL ON FUNCTION "public"."gtrgm_distance"("internal", "text", smallint, "oid", "internal") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."gtrgm_distance"("internal", "text", smallint, "oid", "internal") TO "service_role";
+
+
+
+GRANT ALL ON FUNCTION "public"."gtrgm_options"("internal") TO "postgres";
+GRANT ALL ON FUNCTION "public"."gtrgm_options"("internal") TO "anon";
+GRANT ALL ON FUNCTION "public"."gtrgm_options"("internal") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."gtrgm_options"("internal") TO "service_role";
+
+
+
+GRANT ALL ON FUNCTION "public"."gtrgm_penalty"("internal", "internal", "internal") TO "postgres";
+GRANT ALL ON FUNCTION "public"."gtrgm_penalty"("internal", "internal", "internal") TO "anon";
+GRANT ALL ON FUNCTION "public"."gtrgm_penalty"("internal", "internal", "internal") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."gtrgm_penalty"("internal", "internal", "internal") TO "service_role";
+
+
+
+GRANT ALL ON FUNCTION "public"."gtrgm_picksplit"("internal", "internal") TO "postgres";
+GRANT ALL ON FUNCTION "public"."gtrgm_picksplit"("internal", "internal") TO "anon";
+GRANT ALL ON FUNCTION "public"."gtrgm_picksplit"("internal", "internal") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."gtrgm_picksplit"("internal", "internal") TO "service_role";
+
+
+
+GRANT ALL ON FUNCTION "public"."gtrgm_same"("public"."gtrgm", "public"."gtrgm", "internal") TO "postgres";
+GRANT ALL ON FUNCTION "public"."gtrgm_same"("public"."gtrgm", "public"."gtrgm", "internal") TO "anon";
+GRANT ALL ON FUNCTION "public"."gtrgm_same"("public"."gtrgm", "public"."gtrgm", "internal") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."gtrgm_same"("public"."gtrgm", "public"."gtrgm", "internal") TO "service_role";
+
+
+
+GRANT ALL ON FUNCTION "public"."gtrgm_union"("internal", "internal") TO "postgres";
+GRANT ALL ON FUNCTION "public"."gtrgm_union"("internal", "internal") TO "anon";
+GRANT ALL ON FUNCTION "public"."gtrgm_union"("internal", "internal") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."gtrgm_union"("internal", "internal") TO "service_role";
+
+
+
 GRANT ALL ON FUNCTION "public"."handle_user_registration"() TO "anon";
 GRANT ALL ON FUNCTION "public"."handle_user_registration"() TO "authenticated";
 GRANT ALL ON FUNCTION "public"."handle_user_registration"() TO "service_role";
@@ -2316,6 +2697,83 @@ GRANT ALL ON FUNCTION "public"."ingest_reges_batch"("p_company_id" "uuid", "p_re
 GRANT ALL ON FUNCTION "public"."match_pending_invite"("p_company_id" "uuid", "p_dob_hash" "text", "p_first_norm" "text", "p_last_norm" "text", "p_email_lower" "text") TO "anon";
 GRANT ALL ON FUNCTION "public"."match_pending_invite"("p_company_id" "uuid", "p_dob_hash" "text", "p_first_norm" "text", "p_last_norm" "text", "p_email_lower" "text") TO "authenticated";
 GRANT ALL ON FUNCTION "public"."match_pending_invite"("p_company_id" "uuid", "p_dob_hash" "text", "p_first_norm" "text", "p_last_norm" "text", "p_email_lower" "text") TO "service_role";
+
+
+
+GRANT ALL ON FUNCTION "public"."set_limit"(real) TO "postgres";
+GRANT ALL ON FUNCTION "public"."set_limit"(real) TO "anon";
+GRANT ALL ON FUNCTION "public"."set_limit"(real) TO "authenticated";
+GRANT ALL ON FUNCTION "public"."set_limit"(real) TO "service_role";
+
+
+
+GRANT ALL ON FUNCTION "public"."show_limit"() TO "postgres";
+GRANT ALL ON FUNCTION "public"."show_limit"() TO "anon";
+GRANT ALL ON FUNCTION "public"."show_limit"() TO "authenticated";
+GRANT ALL ON FUNCTION "public"."show_limit"() TO "service_role";
+
+
+
+GRANT ALL ON FUNCTION "public"."show_trgm"("text") TO "postgres";
+GRANT ALL ON FUNCTION "public"."show_trgm"("text") TO "anon";
+GRANT ALL ON FUNCTION "public"."show_trgm"("text") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."show_trgm"("text") TO "service_role";
+
+
+
+GRANT ALL ON FUNCTION "public"."similarity"("text", "text") TO "postgres";
+GRANT ALL ON FUNCTION "public"."similarity"("text", "text") TO "anon";
+GRANT ALL ON FUNCTION "public"."similarity"("text", "text") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."similarity"("text", "text") TO "service_role";
+
+
+
+GRANT ALL ON FUNCTION "public"."similarity_dist"("text", "text") TO "postgres";
+GRANT ALL ON FUNCTION "public"."similarity_dist"("text", "text") TO "anon";
+GRANT ALL ON FUNCTION "public"."similarity_dist"("text", "text") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."similarity_dist"("text", "text") TO "service_role";
+
+
+
+GRANT ALL ON FUNCTION "public"."similarity_op"("text", "text") TO "postgres";
+GRANT ALL ON FUNCTION "public"."similarity_op"("text", "text") TO "anon";
+GRANT ALL ON FUNCTION "public"."similarity_op"("text", "text") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."similarity_op"("text", "text") TO "service_role";
+
+
+
+GRANT ALL ON FUNCTION "public"."strict_word_similarity"("text", "text") TO "postgres";
+GRANT ALL ON FUNCTION "public"."strict_word_similarity"("text", "text") TO "anon";
+GRANT ALL ON FUNCTION "public"."strict_word_similarity"("text", "text") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."strict_word_similarity"("text", "text") TO "service_role";
+
+
+
+GRANT ALL ON FUNCTION "public"."strict_word_similarity_commutator_op"("text", "text") TO "postgres";
+GRANT ALL ON FUNCTION "public"."strict_word_similarity_commutator_op"("text", "text") TO "anon";
+GRANT ALL ON FUNCTION "public"."strict_word_similarity_commutator_op"("text", "text") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."strict_word_similarity_commutator_op"("text", "text") TO "service_role";
+
+
+
+GRANT ALL ON FUNCTION "public"."strict_word_similarity_dist_commutator_op"("text", "text") TO "postgres";
+GRANT ALL ON FUNCTION "public"."strict_word_similarity_dist_commutator_op"("text", "text") TO "anon";
+GRANT ALL ON FUNCTION "public"."strict_word_similarity_dist_commutator_op"("text", "text") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."strict_word_similarity_dist_commutator_op"("text", "text") TO "service_role";
+
+
+
+GRANT ALL ON FUNCTION "public"."strict_word_similarity_dist_op"("text", "text") TO "postgres";
+GRANT ALL ON FUNCTION "public"."strict_word_similarity_dist_op"("text", "text") TO "anon";
+GRANT ALL ON FUNCTION "public"."strict_word_similarity_dist_op"("text", "text") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."strict_word_similarity_dist_op"("text", "text") TO "service_role";
+
+
+
+GRANT ALL ON FUNCTION "public"."strict_word_similarity_op"("text", "text") TO "postgres";
+GRANT ALL ON FUNCTION "public"."strict_word_similarity_op"("text", "text") TO "anon";
+GRANT ALL ON FUNCTION "public"."strict_word_similarity_op"("text", "text") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."strict_word_similarity_op"("text", "text") TO "service_role";
 
 
 
@@ -2346,6 +2804,56 @@ GRANT ALL ON FUNCTION "public"."update_contract_status"() TO "service_role";
 GRANT ALL ON FUNCTION "public"."update_updated_at_column"() TO "anon";
 GRANT ALL ON FUNCTION "public"."update_updated_at_column"() TO "authenticated";
 GRANT ALL ON FUNCTION "public"."update_updated_at_column"() TO "service_role";
+
+
+
+GRANT ALL ON FUNCTION "public"."word_similarity"("text", "text") TO "postgres";
+GRANT ALL ON FUNCTION "public"."word_similarity"("text", "text") TO "anon";
+GRANT ALL ON FUNCTION "public"."word_similarity"("text", "text") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."word_similarity"("text", "text") TO "service_role";
+
+
+
+GRANT ALL ON FUNCTION "public"."word_similarity_commutator_op"("text", "text") TO "postgres";
+GRANT ALL ON FUNCTION "public"."word_similarity_commutator_op"("text", "text") TO "anon";
+GRANT ALL ON FUNCTION "public"."word_similarity_commutator_op"("text", "text") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."word_similarity_commutator_op"("text", "text") TO "service_role";
+
+
+
+GRANT ALL ON FUNCTION "public"."word_similarity_dist_commutator_op"("text", "text") TO "postgres";
+GRANT ALL ON FUNCTION "public"."word_similarity_dist_commutator_op"("text", "text") TO "anon";
+GRANT ALL ON FUNCTION "public"."word_similarity_dist_commutator_op"("text", "text") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."word_similarity_dist_commutator_op"("text", "text") TO "service_role";
+
+
+
+GRANT ALL ON FUNCTION "public"."word_similarity_dist_op"("text", "text") TO "postgres";
+GRANT ALL ON FUNCTION "public"."word_similarity_dist_op"("text", "text") TO "anon";
+GRANT ALL ON FUNCTION "public"."word_similarity_dist_op"("text", "text") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."word_similarity_dist_op"("text", "text") TO "service_role";
+
+
+
+GRANT ALL ON FUNCTION "public"."word_similarity_op"("text", "text") TO "postgres";
+GRANT ALL ON FUNCTION "public"."word_similarity_op"("text", "text") TO "anon";
+GRANT ALL ON FUNCTION "public"."word_similarity_op"("text", "text") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."word_similarity_op"("text", "text") TO "service_role";
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 
@@ -2469,6 +2977,12 @@ GRANT ALL ON SEQUENCE "public"."user_roles_id_seq" TO "service_role";
 
 
 
+
+
+
+
+
+
 ALTER DEFAULT PRIVILEGES FOR ROLE "postgres" IN SCHEMA "public" GRANT ALL ON SEQUENCES TO "postgres";
 ALTER DEFAULT PRIVILEGES FOR ROLE "postgres" IN SCHEMA "public" GRANT ALL ON SEQUENCES TO "anon";
 ALTER DEFAULT PRIVILEGES FOR ROLE "postgres" IN SCHEMA "public" GRANT ALL ON SEQUENCES TO "authenticated";
@@ -2493,6 +3007,30 @@ ALTER DEFAULT PRIVILEGES FOR ROLE "postgres" IN SCHEMA "public" GRANT ALL ON TAB
 ALTER DEFAULT PRIVILEGES FOR ROLE "postgres" IN SCHEMA "public" GRANT ALL ON TABLES TO "anon";
 ALTER DEFAULT PRIVILEGES FOR ROLE "postgres" IN SCHEMA "public" GRANT ALL ON TABLES TO "authenticated";
 ALTER DEFAULT PRIVILEGES FOR ROLE "postgres" IN SCHEMA "public" GRANT ALL ON TABLES TO "service_role";
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Upload a REGES JSON file to /functions/v1/bulk-create as the seeded HR
-# user for the RegesGmail company (see supabase/seed.sql).
+# user for the MobiPass gmail company (see supabase/seed.sql).
 #
 # Usage:
 #   ./scripts/dev/upload-reges.sh /Users/machita/Downloads/raport.txt
@@ -40,7 +40,7 @@ if ! supabase status -o env > /dev/null 2>&1; then
 fi
 eval "$(supabase status -o env 2>/dev/null)"
 
-# Seeded HR user for the RegesGmail company (supabase/seed.sql).
+# Seeded HR user for the MobiPass gmail company (supabase/seed.sql).
 HR_USER_ID="dddddddd-dddd-dddd-dddd-dddddddddddd"
 
 # Sign an HR JWT with the local JWT_SECRET.
@@ -59,7 +59,7 @@ make_jwt() {
 JWT=$(make_jwt "$HR_USER_ID" "hr")
 
 echo "→ Uploading $FILE to $API_URL/functions/v1/bulk-create" >&2
-echo "  as HR user $HR_USER_ID (RegesGmail company, gmail.com domain)" >&2
+echo "  as HR user $HR_USER_ID (MobiPass company, gmail.com domain)" >&2
 echo >&2
 
 curl -sS -X POST "$API_URL/functions/v1/bulk-create" \

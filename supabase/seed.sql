@@ -97,12 +97,18 @@ INSERT INTO public.bike_benefits (user_id)
 VALUES ('aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa'::uuid);
 
 -- ============================================================================
--- REGES E2E company (local dev only)
+-- MobiPass gmail company (local mirror of the single prod gmail company)
 -- ============================================================================
--- A company configured to receive REGES JSON uploads. email_domain is set
--- to 'gmail.com' so real personal gmail addresses can be used during mobile
--- E2E (the OTP is captured by the local Mailpit on port 54324 — nothing
--- leaves your machine). email_pattern 'last_middle_first' resolves to
+-- Local stand-in for the one and only gmail-domain company that exists in
+-- production ('MobiPass', created via scripts/dev/create-company.sh +
+-- scripts/dev/mobipass.env). Fields here mirror that prod row so local and
+-- prod behave identically; only the id is a deterministic seed placeholder
+-- (44444444-…) rather than the prod uuid, and the local HR login below stays
+-- distinct from the reges-claim E2E claimant (see note on the HR user).
+--
+-- email_domain 'gmail.com' lets real personal gmail addresses be used during
+-- mobile E2E (the OTP is captured by the local Mailpit on port 54324 —
+-- nothing leaves your machine). email_pattern 'last_middle_first' resolves to
 -- "{last}?{.{middle}}.{first}" → fodor.horatiu.alexandru@gmail.com when
 -- middle exists, fodor.alexandru@gmail.com when not.
 
@@ -111,17 +117,23 @@ INSERT INTO public.companies (
   contact_email, email_domain, email_pattern
 ) VALUES (
   '44444444-4444-4444-4444-444444444444'::uuid,
-  'RegesGmail',
-  'Local-dev company wired for REGES JSON uploads via gmail.com email domain.',
-  80.00, 36,
-  'hr-reges@gmail.com',
+  'MobiPass',
+  'Bike benefits overhault company',
+  100.00, 36,
+  'fodor.horatiu.alexandru@gmail.com',
   'gmail.com',
   'last_middle_first'::public.email_pattern_kind
 );
 
--- HR user pre-registered for the REGES company so curl-driven uploads can
--- authenticate without OTP. encrypted_password=NULL keeps the registration
--- trigger from firing (same pattern as the existing seed users above).
+-- HR user pre-registered for the MobiPass gmail company so curl-driven uploads
+-- (scripts/dev/upload-reges.sh) can authenticate without OTP.
+-- encrypted_password=NULL keeps the registration trigger from firing (same
+-- pattern as the existing seed users above).
+--
+-- This HR login (hr-reges@gmail.com) is intentionally kept DISTINCT from
+-- fodor.horatiu.alexandru@gmail.com, which the Maestro reges-claim-register
+-- E2E flow registers as a fresh claimant. Keeping them separate means the E2E
+-- reset (which deletes+recreates the claimant) never touches the upload HR.
 INSERT INTO auth.users (
   id, instance_id, aud, role, email, encrypted_password,
   email_confirmed_at, created_at, updated_at,

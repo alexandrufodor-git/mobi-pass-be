@@ -21,9 +21,10 @@ Studio: http://127.0.0.1:54323 · API: http://127.0.0.1:54321 · Mailpit (OTP in
 supabase db reset       # re-runs all migrations, then supabase/seed.sql
 ```
 
-The seed creates demo companies and users, including the **RegesGmail** company
-(`44444444-…-444444444444`, `email_domain=gmail.com`) and its HR user
-`hr-reges@gmail.com` — wired so curl-driven REGES uploads work without OTP.
+The seed creates demo companies and users, including the **MobiPass** gmail
+company (`44444444-…-444444444444`, `email_domain=gmail.com`) — a local mirror
+of the single gmail-domain company that exists in production — and its HR user
+`hr-reges@gmail.com`, wired so curl-driven REGES uploads work without OTP.
 The seed does **not** create any REGES invites; those are produced at runtime by
 the upload in step 4.
 
@@ -37,6 +38,13 @@ The Vault is cleared whenever the containers restart, so re-run these after
 ./scripts/setup-e2e-vault.sh    # E2E secrets; also (re)starts `functions serve`
 ```
 
+> `setup-e2e-vault.sh` upserts five Vault rows: `e2e_secret`,
+> `e2e_default_password`, `e2e_bike_id`, and `e2e_reges`. The last one is the
+> REGES JSON array used by `e2e-seed` to re-create the test employee on every
+> Maestro reset; it's loaded from `scripts/dev/assets/e2e-reges.json`
+> (gitignored — keeps the valid-format CNP out of source). If that file is
+> missing, ask a teammate or check your local Downloads/REGES export.
+
 > `setup-e2e-vault.sh` starts `supabase functions serve` in the background by
 > default (logs: `.supabase-functions-serve.log`). If you'd rather run it
 > yourself, pass `--no-serve` and start it manually:
@@ -48,7 +56,8 @@ The Vault is cleared whenever the containers restart, so re-run these after
 ### 4. Upload REGES data (creates employee invites)
 
 Posts a REGES JSON export to `/functions/v1/bulk-create`, authenticated as the
-seeded RegesGmail HR user. This is how REGES invites + PII get created locally.
+seeded MobiPass gmail-company HR user. This is how REGES invites + PII get
+created locally.
 
 ```bash
 ./scripts/dev/upload-reges.sh /Users/machita/Downloads/raport.json
