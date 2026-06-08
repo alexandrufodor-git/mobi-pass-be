@@ -13,6 +13,13 @@ SET client_min_messages = warning;
 SET row_security = off;
 
 
+CREATE EXTENSION IF NOT EXISTS "pg_cron" WITH SCHEMA "pg_catalog";
+
+
+
+
+
+
 CREATE EXTENSION IF NOT EXISTS "pg_net" WITH SCHEMA "extensions";
 
 
@@ -250,6 +257,159 @@ COMMENT ON FUNCTION "public"."authorize"("requested_permission" "public"."user_r
 
 
 
+CREATE OR REPLACE FUNCTION "public"."bike_sync_invoke"("p_run_id" "uuid", "p_branch" "text") RETURNS bigint
+    LANGUAGE "plpgsql" SECURITY DEFINER
+    SET "search_path" TO 'public', 'net', 'vault'
+    AS $$
+DECLARE
+  v_secret     text;
+  v_base       text;
+  v_request_id bigint;
+BEGIN
+  SELECT decrypted_secret INTO v_secret
+    FROM vault.decrypted_secrets WHERE name = 'bike_sync_webhook_secret' LIMIT 1;
+  IF v_secret IS NULL THEN
+    RAISE WARNING '[bike_sync_invoke] Vault secret "bike_sync_webhook_secret" not found — invocation skipped';
+    RETURN NULL;
+  END IF;
+
+  SELECT decrypted_secret INTO v_base
+    FROM vault.decrypted_secrets WHERE name = 'bike_sync_base_url' LIMIT 1;
+  v_base := COALESCE(v_base, 'https://xlfkdumbsflqxpezolhl.supabase.co');
+
+  SELECT net.http_post(
+    url     := v_base || '/functions/v1/bike-sync',
+    headers := jsonb_build_object(
+      'Content-Type',     'application/json',
+      'x-webhook-secret', v_secret
+    ),
+    body    := jsonb_build_object('run_id', p_run_id, 'branch', p_branch),
+    timeout_milliseconds := 30000
+  ) INTO v_request_id;
+
+  RETURN v_request_id;
+END;
+$$;
+
+
+ALTER FUNCTION "public"."bike_sync_invoke"("p_run_id" "uuid", "p_branch" "text") OWNER TO "postgres";
+
+
+COMMENT ON FUNCTION "public"."bike_sync_invoke"("p_run_id" "uuid", "p_branch" "text") IS 'Fire-and-forget pg_net POST to the bike-sync edge fn for one branch drain. Base URL from Vault secret bike_sync_base_url (falls back to prod). Webhook secret from Vault (bike_sync_webhook_secret).';
+
+
+
+CREATE OR REPLACE FUNCTION "public"."bike_sync_kickoff"("p_mode" "text" DEFAULT 'manual'::"text", "p_categories" "text"[] DEFAULT NULL::"text"[]) RETURNS "uuid"
+    LANGUAGE "plpgsql" SECURITY DEFINER
+    SET "search_path" TO 'public'
+    AS $$
+DECLARE
+  c_dealer    constant uuid   := '099380e6-5991-4acc-b737-9815365bf9d1';  -- Bella Bike
+  c_leaves    constant text[] := ARRAY['721', '722', '723', '725', '751'];
+  v_cats      text[];
+  v_watermark timestamptz;
+  v_run_id    uuid;
+  v_cat       text;
+BEGIN
+  v_cats := COALESCE(p_categories, c_leaves);
+
+  SELECT max(watermark_to) INTO v_watermark
+    FROM sync_runs WHERE dealer_id = c_dealer AND status = 'succeeded';
+
+  INSERT INTO sync_runs (dealer_id, mode, status, watermark_from, watermark_to)
+  VALUES (
+    c_dealer, p_mode, 'running',
+    CASE WHEN p_mode = 'weekly' THEN NULL ELSE v_watermark END,
+    now()
+  )
+  RETURNING id INTO v_run_id;
+
+  -- One prepare unit per category; each fans out its own rest_page units.
+  FOREACH v_cat IN ARRAY v_cats LOOP
+    INSERT INTO sync_units (run_id, branch, kind, category_id)
+    VALUES (v_run_id, 'sync', 'prepare', v_cat);
+  END LOOP;
+
+  PERFORM public.bike_sync_invoke(v_run_id, 'sync');
+  RETURN v_run_id;
+END;
+$$;
+
+
+ALTER FUNCTION "public"."bike_sync_kickoff"("p_mode" "text", "p_categories" "text"[]) OWNER TO "postgres";
+
+
+COMMENT ON FUNCTION "public"."bike_sync_kickoff"("p_mode" "text", "p_categories" "text"[]) IS 'Seed a BellaBike sync run + SYNC-branch queue (one unit per leaf category) and fire the first edge-fn invocation. p_categories restricts the run for staged manual rollout.';
+
+
+
+CREATE OR REPLACE FUNCTION "public"."bike_sync_tick"() RETURNS integer
+    LANGUAGE "plpgsql" SECURITY DEFINER
+    SET "search_path" TO 'public'
+    AS $$
+DECLARE
+  c_max_lanes constant integer := 2;   -- concurrency cap (vendor rate-limit knob)
+  r            record;
+  v_inflight   integer;
+  v_sync_claim integer;
+  v_audit_claim integer;
+  v_slots      integer;
+  v_fired      integer := 0;
+  i            integer;
+BEGIN
+  FOR r IN SELECT id FROM sync_runs WHERE status = 'running' LOOP
+    SELECT count(*) INTO v_inflight FROM sync_units
+      WHERE run_id = r.id AND status = 'running'
+        AND leased_until IS NOT NULL AND leased_until >= now();
+
+    SELECT count(*) INTO v_sync_claim FROM sync_units
+      WHERE run_id = r.id AND branch = 'sync'
+        AND ( (status = 'enqueued' AND (next_retry_at IS NULL OR next_retry_at <= now()))
+           OR (status = 'running'  AND leased_until IS NOT NULL AND leased_until < now()) );
+
+    SELECT count(*) INTO v_audit_claim FROM sync_units
+      WHERE run_id = r.id AND branch = 'audit'
+        AND ( (status = 'enqueued' AND (next_retry_at IS NULL OR next_retry_at <= now()))
+           OR (status = 'running'  AND leased_until IS NOT NULL AND leased_until < now()) );
+
+    v_slots := c_max_lanes - v_inflight;
+
+    IF v_slots > 0 AND v_sync_claim > 0 THEN
+      FOR i IN 1..LEAST(v_slots, v_sync_claim) LOOP
+        PERFORM public.bike_sync_invoke(r.id, 'sync'); v_fired := v_fired + 1;
+      END LOOP;
+
+    ELSIF v_slots > 0 AND v_audit_claim > 0 THEN
+      FOR i IN 1..LEAST(v_slots, v_audit_claim) LOOP
+        PERFORM public.bike_sync_invoke(r.id, 'audit'); v_fired := v_fired + 1;
+      END LOOP;
+
+    ELSIF v_inflight = 0 AND v_sync_claim = 0 AND v_audit_claim = 0 THEN
+      -- Truly idle: either sync drained but audit not seeded, or all done.
+      IF NOT EXISTS (SELECT 1 FROM sync_units WHERE run_id = r.id AND branch = 'audit')
+         AND NOT EXISTS (SELECT 1 FROM sync_units
+                          WHERE run_id = r.id AND branch = 'sync'
+                            AND status IN ('enqueued', 'running')) THEN
+        PERFORM public.seed_audit_units(r.id);
+        PERFORM public.bike_sync_invoke(r.id, 'audit'); v_fired := v_fired + 1;
+      ELSE
+        PERFORM public.finalize_sync_run(r.id);
+      END IF;
+    END IF;
+  END LOOP;
+
+  RETURN v_fired;
+END;
+$$;
+
+
+ALTER FUNCTION "public"."bike_sync_tick"() OWNER TO "postgres";
+
+
+COMMENT ON FUNCTION "public"."bike_sync_tick"() IS 'pg_cron heartbeat: drives every running sync_run by firing up to MAX_LANES−inflight bike-sync workers, transitions sync→audit, and finalizes drained runs. Decouples liveness from any single edge isolate.';
+
+
+
 CREATE OR REPLACE FUNCTION "public"."calc_employee_prices"("p_full_price" numeric, "p_monthly_subsidy" numeric, "p_contract_months" integer) RETURNS TABLE("employee_price" numeric, "monthly_employee_price" numeric)
     LANGUAGE "sql" IMMUTABLE
     AS $$
@@ -315,34 +475,168 @@ ALTER FUNCTION "public"."calculate_employee_bike_price"("p_full_price" numeric, 
 COMMENT ON FUNCTION "public"."calculate_employee_bike_price"("p_full_price" numeric, "p_company_id" "uuid") IS 'Calculates the employee price for a bike based on company subsidy. Formula: full_price - (monthly_subsidy * contract_months)';
 
 
+SET default_tablespace = '';
+
+SET default_table_access_method = "heap";
+
+
+CREATE TABLE IF NOT EXISTS "public"."sync_units" (
+    "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,
+    "run_id" "uuid" NOT NULL,
+    "branch" "text" NOT NULL,
+    "kind" "text" NOT NULL,
+    "category_id" "text",
+    "status" "text" DEFAULT 'enqueued'::"text" NOT NULL,
+    "attempts" integer DEFAULT 0 NOT NULL,
+    "next_retry_at" timestamp with time zone,
+    "n_fetched" integer DEFAULT 0 NOT NULL,
+    "n_upserted" integer DEFAULT 0 NOT NULL,
+    "n_models_upserted" integer DEFAULT 0 NOT NULL,
+    "n_failed" integer DEFAULT 0 NOT NULL,
+    "error" "text",
+    "started_at" timestamp with time zone,
+    "finished_at" timestamp with time zone,
+    "created_at" timestamp with time zone DEFAULT "now"() NOT NULL,
+    "page" integer,
+    "page_size" integer,
+    "leased_until" timestamp with time zone,
+    CONSTRAINT "sync_units_branch_check" CHECK (("branch" = ANY (ARRAY['sync'::"text", 'audit'::"text"]))),
+    CONSTRAINT "sync_units_kind_check" CHECK (("kind" = ANY (ARRAY['rest_category'::"text", 'prepare'::"text", 'rest_page'::"text", 'gql_membership'::"text", 'verify'::"text"]))),
+    CONSTRAINT "sync_units_status_check" CHECK (("status" = ANY (ARRAY['enqueued'::"text", 'running'::"text", 'succeeded'::"text", 'failed'::"text", 'skipped'::"text"])))
+);
+
+
+ALTER TABLE "public"."sync_units" OWNER TO "postgres";
+
+
+COMMENT ON TABLE "public"."sync_units" IS 'WorkManager-style queue: one unit per category per branch. Drained by the bike-sync edge fn via FOR UPDATE SKIP LOCKED; retried 3x with backoff (next_retry_at).';
+
+
+
+CREATE OR REPLACE FUNCTION "public"."claim_next_sync_unit"("p_run_id" "uuid", "p_branch" "text", "p_lease_seconds" integer DEFAULT 90) RETURNS "public"."sync_units"
+    LANGUAGE "plpgsql" SECURITY DEFINER
+    SET "search_path" TO 'public'
+    AS $$
+DECLARE v_unit public.sync_units;
+BEGIN
+  UPDATE sync_units SET
+    status       = 'running',
+    attempts     = attempts + 1,
+    started_at   = COALESCE(started_at, now()),
+    leased_until = now() + (p_lease_seconds * interval '1 second')
+  WHERE id = (
+    SELECT id FROM sync_units
+    WHERE run_id = p_run_id
+      AND branch = p_branch
+      AND (
+            (status = 'enqueued' AND (next_retry_at IS NULL OR next_retry_at <= now()))
+         OR (status = 'running'  AND leased_until IS NOT NULL AND leased_until < now())
+      )
+    ORDER BY created_at
+    FOR UPDATE SKIP LOCKED
+    LIMIT 1
+  )
+  RETURNING * INTO v_unit;
+
+  IF NOT FOUND THEN
+    RETURN NULL;
+  END IF;
+  RETURN v_unit;
+END;
+$$;
+
+
+ALTER FUNCTION "public"."claim_next_sync_unit"("p_run_id" "uuid", "p_branch" "text", "p_lease_seconds" integer) OWNER TO "postgres";
+
+
+COMMENT ON FUNCTION "public"."claim_next_sync_unit"("p_run_id" "uuid", "p_branch" "text", "p_lease_seconds" integer) IS 'Lease-based queue pop: claims an enqueued unit OR steals one whose lease expired (dead worker). FOR UPDATE SKIP LOCKED. Sets leased_until = now()+p_lease_seconds.';
+
+
+
+CREATE OR REPLACE FUNCTION "public"."complete_sync_unit"("p_unit_id" "uuid", "p_status" "text", "p_n_fetched" integer DEFAULT 0, "p_n_inserted" integer DEFAULT 0, "p_n_updated" integer DEFAULT 0, "p_n_models" integer DEFAULT 0, "p_n_failed" integer DEFAULT 0, "p_error" "text" DEFAULT NULL::"text") RETURNS "text"
+    LANGUAGE "plpgsql" SECURITY DEFINER
+    SET "search_path" TO 'public'
+    AS $$
+DECLARE
+  v_attempts integer;
+  v_run_id   uuid;
+BEGIN
+  SELECT attempts, run_id INTO v_attempts, v_run_id FROM sync_units WHERE id = p_unit_id;
+
+  IF p_status = 'failed' AND v_attempts < 3 THEN
+    UPDATE sync_units SET
+      status        = 'enqueued',
+      leased_until  = NULL,
+      next_retry_at = now() + (v_attempts * interval '20 seconds'),
+      error         = p_error
+    WHERE id = p_unit_id;
+    RETURN 'retry';
+  END IF;
+
+  UPDATE sync_units SET
+    status            = p_status,
+    leased_until      = NULL,
+    n_fetched         = p_n_fetched,
+    n_upserted        = p_n_inserted + p_n_updated,
+    n_models_upserted = p_n_models,
+    n_failed          = p_n_failed,
+    error             = p_error,
+    finished_at       = now()
+  WHERE id = p_unit_id;
+
+  UPDATE sync_runs SET
+    n_fetched         = n_fetched         + p_n_fetched,
+    n_inserted        = n_inserted        + p_n_inserted,
+    n_updated         = n_updated         + p_n_updated,
+    n_models_upserted = n_models_upserted + p_n_models,
+    n_failed          = n_failed          + p_n_failed
+  WHERE id = v_run_id;
+
+  RETURN p_status;
+END;
+$$;
+
+
+ALTER FUNCTION "public"."complete_sync_unit"("p_unit_id" "uuid", "p_status" "text", "p_n_fetched" integer, "p_n_inserted" integer, "p_n_updated" integer, "p_n_models" integer, "p_n_failed" integer, "p_error" "text") OWNER TO "postgres";
+
 
 CREATE OR REPLACE FUNCTION "public"."custom_access_token_hook"("event" "jsonb") RETURNS "jsonb"
     LANGUAGE "plpgsql" STABLE SECURITY DEFINER
     SET "search_path" TO 'public'
     AS $$
 DECLARE
-  claims jsonb;
-  user_role public.user_role;
+  claims    jsonb;
+  v_user_id uuid := (event->>'user_id')::uuid;
+  v_roles   text[];
 BEGIN
   -- Get existing claims
   claims := event->'claims';
-  
-  -- Fetch user role from user_roles table
-  SELECT role INTO user_role 
-  FROM public.user_roles 
-  WHERE user_id = (event->>'user_id')::uuid;
-  
-  -- Add user_role to JWT claims
-  IF user_role IS NOT NULL THEN
-    claims := jsonb_set(claims, '{user_role}', to_jsonb(user_role));
+
+  -- All roles for this user, ordered by privilege (admin > hr > employee).
+  SELECT array_agg(role::text ORDER BY
+           CASE role
+             WHEN 'admin'    THEN 1
+             WHEN 'hr'       THEN 2
+             WHEN 'employee' THEN 3
+             ELSE 99
+           END)
+  INTO v_roles
+  FROM public.user_roles
+  WHERE user_id = v_user_id;
+
+  IF v_roles IS NULL OR array_length(v_roles, 1) IS NULL THEN
+    -- No role assigned
+    claims := jsonb_set(claims, '{user_role}',  'null'::jsonb);
+    claims := jsonb_set(claims, '{user_roles}', '[]'::jsonb);
   ELSE
-    -- No role assigned, set to null
-    claims := jsonb_set(claims, '{user_role}', 'null');
+    -- Highest-privilege role is first in the priv-ordered array.
+    claims := jsonb_set(claims, '{user_role}',  to_jsonb(v_roles[1]));
+    claims := jsonb_set(claims, '{user_roles}', to_jsonb(v_roles));
   END IF;
-  
+
   -- Update claims in the event
   event := jsonb_set(event, '{claims}', claims);
-  
+
   RETURN event;
 END;
 $$;
@@ -351,11 +645,106 @@ $$;
 ALTER FUNCTION "public"."custom_access_token_hook"("event" "jsonb") OWNER TO "postgres";
 
 
-COMMENT ON FUNCTION "public"."custom_access_token_hook"("event" "jsonb") IS 'Auth hook that injects user_role (admin/hr/employee) into JWT claims.
-No device validation - security enforced via:
-1. RLS policies based on user_role
-2. Client-side app logic to show/hide features by role';
+COMMENT ON FUNCTION "public"."custom_access_token_hook"("event" "jsonb") IS 'Auth hook that injects role claims into the JWT:
+  - user_role  : the deterministic highest-privilege role (admin > hr > employee)
+  - user_roles : the full priv-ordered array of the user''s roles (e.g. ["hr","employee"])
+Multi-role aware (an HR user can also be an employee). No device validation - security enforced via:
+1. RLS policies / edge-function guards based on the role claims
+2. Employee-only actions gate on a DB user_roles row, never on the single user_role claim';
 
+
+
+CREATE OR REPLACE FUNCTION "public"."enqueue_page_units"("p_run_id" "uuid", "p_category_id" "text", "p_total" integer, "p_page_size" integer) RETURNS integer
+    LANGUAGE "plpgsql" SECURITY DEFINER
+    SET "search_path" TO 'public'
+    AS $$
+DECLARE
+  v_pages integer := CEIL(GREATEST(p_total, 0)::numeric / GREATEST(p_page_size, 1));
+  p       integer;
+BEGIN
+  FOR p IN 1..v_pages LOOP
+    INSERT INTO sync_units (run_id, branch, kind, category_id, page, page_size)
+    VALUES (p_run_id, 'sync', 'rest_page', p_category_id, p, p_page_size)
+    ON CONFLICT (run_id, branch, category_id, page) WHERE kind = 'rest_page'
+    DO NOTHING;
+  END LOOP;
+  RETURN v_pages;
+END;
+$$;
+
+
+ALTER FUNCTION "public"."enqueue_page_units"("p_run_id" "uuid", "p_category_id" "text", "p_total" integer, "p_page_size" integer) OWNER TO "postgres";
+
+
+COMMENT ON FUNCTION "public"."enqueue_page_units"("p_run_id" "uuid", "p_category_id" "text", "p_total" integer, "p_page_size" integer) IS 'Fan out one rest_page unit per page of a category (idempotent via the uq_sync_units_page index).';
+
+
+
+CREATE TABLE IF NOT EXISTS "public"."sync_runs" (
+    "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,
+    "dealer_id" "uuid" NOT NULL,
+    "mode" "text" NOT NULL,
+    "status" "text" DEFAULT 'running'::"text" NOT NULL,
+    "started_at" timestamp with time zone DEFAULT "now"() NOT NULL,
+    "finished_at" timestamp with time zone,
+    "watermark_from" timestamp with time zone,
+    "watermark_to" timestamp with time zone,
+    "n_fetched" integer DEFAULT 0 NOT NULL,
+    "n_inserted" integer DEFAULT 0 NOT NULL,
+    "n_updated" integer DEFAULT 0 NOT NULL,
+    "n_unchanged" integer DEFAULT 0 NOT NULL,
+    "n_failed" integer DEFAULT 0 NOT NULL,
+    "n_delisted" integer DEFAULT 0 NOT NULL,
+    "n_models_upserted" integer DEFAULT 0 NOT NULL,
+    "error" "text",
+    CONSTRAINT "sync_runs_mode_check" CHECK (("mode" = ANY (ARRAY['daily'::"text", 'weekly'::"text", 'manual'::"text"]))),
+    CONSTRAINT "sync_runs_status_check" CHECK (("status" = ANY (ARRAY['running'::"text", 'succeeded'::"text", 'partial'::"text", 'failed'::"text"])))
+);
+
+
+ALTER TABLE "public"."sync_runs" OWNER TO "postgres";
+
+
+COMMENT ON TABLE "public"."sync_runs" IS 'One row per BellaBike sync fire. Watermark for the next delta = MAX(watermark_to) WHERE status=''succeeded''.';
+
+
+
+CREATE OR REPLACE FUNCTION "public"."finalize_sync_run"("p_run_id" "uuid") RETURNS "public"."sync_runs"
+    LANGUAGE "plpgsql" SECURITY DEFINER
+    SET "search_path" TO 'public'
+    AS $$
+DECLARE
+  v_succeeded integer;
+  v_failed    integer;
+  v_pending   integer;
+  v_status    text;
+  v_run       public.sync_runs;
+BEGIN
+  SELECT count(*) FILTER (WHERE status = 'succeeded'),
+         count(*) FILTER (WHERE status = 'failed'),
+         count(*) FILTER (WHERE status IN ('enqueued', 'running'))
+    INTO v_succeeded, v_failed, v_pending
+    FROM sync_units WHERE run_id = p_run_id;
+
+  IF v_pending > 0 THEN
+    SELECT * INTO v_run FROM sync_runs WHERE id = p_run_id;
+    RETURN v_run;
+  END IF;
+
+  IF    v_failed = 0    THEN v_status := 'succeeded';
+  ELSIF v_succeeded = 0 THEN v_status := 'failed';
+  ELSE                       v_status := 'partial';
+  END IF;
+
+  UPDATE sync_runs SET status = v_status, finished_at = now()
+  WHERE id = p_run_id
+  RETURNING * INTO v_run;
+  RETURN v_run;
+END;
+$$;
+
+
+ALTER FUNCTION "public"."finalize_sync_run"("p_run_id" "uuid") OWNER TO "postgres";
 
 
 CREATE OR REPLACE FUNCTION "public"."get_company_terms_for_user"("p_user_id" "uuid") RETURNS TABLE("monthly_benefit_subsidy" numeric, "contract_months" integer, "currency" "public"."currency_type")
@@ -443,7 +832,8 @@ DECLARE
 BEGIN
   IF NEW.email_confirmed_at IS NOT NULL THEN
 
-    -- 1. Resolve company_id and employee fields from profile_invites
+    -- 1. Resolve company_id and employee fields from profile_invites.
+    --    Match on email OR derived_email; prefer the exact-email invite.
     SELECT
       pi.id,
       pi.company_id,
@@ -462,40 +852,47 @@ BEGIN
       v_hire_date
     FROM public.profile_invites pi
     WHERE LOWER(pi.email) = LOWER(NEW.email)
+       OR LOWER(pi.derived_email) = LOWER(NEW.email)
+    ORDER BY (LOWER(pi.email) = LOWER(NEW.email)) DESC NULLS LAST
     LIMIT 1;
 
     IF v_company_id IS NULL THEN
       RAISE EXCEPTION 'No active invite found for email %', NEW.email;
     END IF;
 
-    -- 2. Create or update profile (must exist before user_roles FK insert)
+    -- 2. Create or update profile (must exist before user_roles FK insert).
+    --    profile_invite_id stamps the canonical person link.
     INSERT INTO public.profiles (
       user_id, email, status, company_id,
-      first_name, last_name, description, department, hire_date
+      first_name, last_name, description, department, hire_date,
+      profile_invite_id
     )
     VALUES (
       NEW.id, NEW.email, 'active'::public.user_profile_status, v_company_id,
-      v_first_name, v_last_name, v_description, v_department, v_hire_date
+      v_first_name, v_last_name, v_description, v_department, v_hire_date,
+      v_invite_id
     )
     ON CONFLICT (user_id) DO UPDATE SET
-      email       = EXCLUDED.email,
-      status      = 'active'::public.user_profile_status,
-      company_id  = EXCLUDED.company_id,
-      first_name  = EXCLUDED.first_name,
-      last_name   = EXCLUDED.last_name,
-      description = EXCLUDED.description,
-      department  = EXCLUDED.department,
-      hire_date   = EXCLUDED.hire_date;
+      email             = EXCLUDED.email,
+      status            = 'active'::public.user_profile_status,
+      company_id        = EXCLUDED.company_id,
+      first_name        = EXCLUDED.first_name,
+      last_name         = EXCLUDED.last_name,
+      description       = EXCLUDED.description,
+      department        = EXCLUDED.department,
+      hire_date         = EXCLUDED.hire_date,
+      profile_invite_id = EXCLUDED.profile_invite_id;
 
     -- 3. Assign 'employee' role
     INSERT INTO public.user_roles (user_id, role)
     VALUES (NEW.id, 'employee'::public.user_role)
     ON CONFLICT (user_id, role) DO NOTHING;
 
-    -- 4. Update profile_invites status
+    -- 4. Update profile_invites status (by id — covers derived-email matches
+    --    where email may be NULL on the invite).
     UPDATE public.profile_invites
     SET status = 'active'::public.user_profile_status
-    WHERE LOWER(email) = LOWER(NEW.email);
+    WHERE id = v_invite_id;
 
     -- 4.5. Link any pending REGES PII to this user
     UPDATE public.employee_pii
@@ -789,6 +1186,260 @@ $$;
 ALTER FUNCTION "public"."match_pending_invite"("p_company_id" "uuid", "p_dob_hash" "text", "p_first_norm" "text", "p_last_norm" "text", "p_email_lower" "text") OWNER TO "postgres";
 
 
+CREATE OR REPLACE FUNCTION "public"."merge_bike_offers"("p_dealer_id" "uuid", "p_models" "jsonb") RETURNS "jsonb"
+    LANGUAGE "plpgsql" SECURITY DEFINER
+    SET "search_path" TO 'public'
+    AS $$
+DECLARE
+  m           jsonb;
+  o           jsonb;
+  v_model_id  uuid;
+  v_offer_ins boolean;
+  n_models    integer := 0;
+  n_inserted  integer := 0;
+  n_updated   integer := 0;
+  n_offers    integer := 0;
+BEGIN
+  FOR m IN SELECT * FROM jsonb_array_elements(p_models)
+  LOOP
+    INSERT INTO bike_models (
+      dealer_id, external_parent_sku, mpn, ean, brand, name, type,
+      description, images, raw_specs
+    ) VALUES (
+      p_dealer_id,
+      m->>'external_parent_sku',
+      m->>'mpn', m->>'ean', m->>'brand', m->>'name',
+      NULLIF(m->>'type', '')::bike_type,
+      m->>'description',
+      m->'images',
+      m->'raw_specs'
+    )
+    ON CONFLICT (dealer_id, external_parent_sku) DO UPDATE SET
+      mpn         = EXCLUDED.mpn,
+      ean         = EXCLUDED.ean,
+      brand       = EXCLUDED.brand,
+      name        = EXCLUDED.name,
+      type        = EXCLUDED.type,
+      description = EXCLUDED.description,
+      images      = EXCLUDED.images,
+      raw_specs   = EXCLUDED.raw_specs
+      -- in_catalog deliberately preserved — set by the audit branch.
+    RETURNING id INTO v_model_id;
+    n_models := n_models + 1;
+
+    FOR o IN SELECT * FROM jsonb_array_elements(COALESCE(m->'offers', '[]'::jsonb))
+    LOOP
+      INSERT INTO bikes (
+        name, brand, description, image_url, images, type,
+        full_price, list_price, special_price, special_from, special_to,
+        in_stock, frame_size, wheel_size, frame_material, power_wh, engine,
+        available_for_test, sku, dealer_id, model_id, source, raw_specs,
+        active, first_seen_at, last_seen_at, last_in_stock_at
+      ) VALUES (
+        m->>'name', m->>'brand', m->>'description',
+        m->'images'->>0, m->'images', NULLIF(m->>'type', '')::bike_type,
+        COALESCE((o->>'full_price')::numeric, 0),
+        (o->>'list_price')::numeric,
+        (o->>'special_price')::numeric,
+        (o->>'special_from')::timestamptz,
+        (o->>'special_to')::timestamptz,
+        -- INSERT: a brand-new offer with unknown stock defaults to false.
+        COALESCE((o->>'in_stock')::boolean, false),
+        o->>'frame_size', o->>'wheel_size', o->>'frame_material',
+        (o->>'power_wh')::integer, o->>'engine',
+        COALESCE((o->>'available_for_test')::boolean, true),
+        o->>'sku', p_dealer_id, v_model_id,
+        COALESCE(o->>'source', 'bellabike'),
+        o->'raw_specs',
+        true, now(), now(),
+        CASE WHEN (o->>'in_stock')::boolean IS TRUE THEN now() ELSE NULL END
+      )
+      ON CONFLICT (dealer_id, sku) DO UPDATE SET
+        name               = EXCLUDED.name,
+        brand              = EXCLUDED.brand,
+        description        = EXCLUDED.description,
+        image_url          = EXCLUDED.image_url,
+        images             = EXCLUDED.images,
+        type               = EXCLUDED.type,
+        full_price         = EXCLUDED.full_price,
+        list_price         = EXCLUDED.list_price,
+        special_price      = EXCLUDED.special_price,
+        special_from       = EXCLUDED.special_from,
+        special_to         = EXCLUDED.special_to,
+        -- UPDATE: unknown stock (null) keeps the existing flag — never forces
+        -- false. `o` is in scope, so read the raw nullable value directly
+        -- (EXCLUDED.in_stock has already been COALESCEd to false above).
+        in_stock           = COALESCE((o->>'in_stock')::boolean, bikes.in_stock),
+        frame_size         = EXCLUDED.frame_size,
+        wheel_size         = EXCLUDED.wheel_size,
+        frame_material     = EXCLUDED.frame_material,
+        power_wh           = EXCLUDED.power_wh,
+        engine             = EXCLUDED.engine,
+        available_for_test = EXCLUDED.available_for_test,
+        model_id           = EXCLUDED.model_id,
+        source             = EXCLUDED.source,
+        raw_specs          = EXCLUDED.raw_specs,
+        active             = true,
+        delisted_at        = NULL,
+        last_seen_at       = now(),
+        -- only bump when we actually OBSERVED in-stock this run (null → keep).
+        last_in_stock_at   = CASE WHEN (o->>'in_stock')::boolean IS TRUE THEN now()
+                                  ELSE bikes.last_in_stock_at END
+      RETURNING (xmax::text::bigint = 0) INTO v_offer_ins;
+
+      IF v_offer_ins THEN n_inserted := n_inserted + 1;
+      ELSE                n_updated  := n_updated  + 1;
+      END IF;
+      n_offers := n_offers + 1;
+    END LOOP;
+  END LOOP;
+
+  RETURN jsonb_build_object(
+    'n_models_upserted', n_models,
+    'n_inserted',        n_inserted,
+    'n_updated',         n_updated,
+    'n_offers',          n_offers
+  );
+END;
+$$;
+
+
+ALTER FUNCTION "public"."merge_bike_offers"("p_dealer_id" "uuid", "p_models" "jsonb") OWNER TO "postgres";
+
+
+COMMENT ON FUNCTION "public"."merge_bike_offers"("p_dealer_id" "uuid", "p_models" "jsonb") IS 'Single writer: upserts bike_models (parent, by dealer_id+external_parent_sku) and bikes (offer, by dealer_id+sku) in one pass. Duplicated model columns are copied onto each offer here. in_catalog preserved (audit-owned).';
+
+
+
+CREATE OR REPLACE FUNCTION "public"."seed_audit_units"("p_run_id" "uuid") RETURNS "void"
+    LANGUAGE "plpgsql" SECURITY DEFINER
+    SET "search_path" TO 'public'
+    AS $$
+BEGIN
+  IF EXISTS (SELECT 1 FROM sync_units WHERE run_id = p_run_id AND branch = 'audit') THEN
+    RETURN;   -- already seeded
+  END IF;
+  INSERT INTO sync_units (run_id, branch, kind) VALUES
+    (p_run_id, 'audit', 'gql_membership'),
+    (p_run_id, 'audit', 'verify');
+END;
+$$;
+
+
+ALTER FUNCTION "public"."seed_audit_units"("p_run_id" "uuid") OWNER TO "postgres";
+
+
+CREATE TABLE IF NOT EXISTS "public"."bikes" (
+    "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,
+    "name" "text" NOT NULL,
+    "created_at" timestamp with time zone DEFAULT "now"() NOT NULL,
+    "updated_at" timestamp with time zone DEFAULT "now"() NOT NULL,
+    "brand" "text",
+    "description" "text",
+    "image_url" "text",
+    "full_price" numeric(10,2) DEFAULT 0 NOT NULL,
+    "employee_price" numeric(10,2),
+    "weight_kg" numeric(5,2),
+    "charge_time_hours" numeric(4,2),
+    "range_max_km" integer,
+    "power_wh" integer,
+    "engine" "text",
+    "supported_features" "text",
+    "frame_material" "text",
+    "frame_size" "text",
+    "wheel_size" "text",
+    "wheel_bandwidth" "text",
+    "lock_type" "text",
+    "sku" "text",
+    "available_for_test" boolean DEFAULT true,
+    "in_stock" boolean DEFAULT true,
+    "type" "public"."bike_type",
+    "images" "jsonb",
+    "dealer_id" "uuid" NOT NULL,
+    "model_id" "uuid",
+    "source" "text",
+    "active" boolean DEFAULT true NOT NULL,
+    "delisted_at" timestamp with time zone,
+    "first_seen_at" timestamp with time zone,
+    "last_seen_at" timestamp with time zone,
+    "last_in_stock_at" timestamp with time zone,
+    "list_price" numeric(10,2),
+    "special_price" numeric(10,2),
+    "special_from" timestamp with time zone,
+    "special_to" timestamp with time zone,
+    "raw_specs" "jsonb"
+);
+
+
+ALTER TABLE "public"."bikes" OWNER TO "postgres";
+
+
+COMMENT ON COLUMN "public"."bikes"."full_price" IS 'Effective price = LEAST(list_price, special_price when in window). UNCHANGED benefit basis — both pricing fns key off this.';
+
+
+
+COMMENT ON COLUMN "public"."bikes"."type" IS 'Type/category of the bike (e.g., e-MTB, e-city, e-touring)';
+
+
+
+COMMENT ON COLUMN "public"."bikes"."model_id" IS 'Parent bike_models row (ON DELETE RESTRICT). The selectable/orderable unit stays bikes.';
+
+
+
+COMMENT ON COLUMN "public"."bikes"."source" IS 'Provenance vendor key (e.g. ''bellabike''). NULL for legacy Maros rows.';
+
+
+
+COMMENT ON COLUMN "public"."bikes"."last_in_stock_at" IS 'Last time this offer was seen in stock (is-product-salable/2 = true). Powers back-in-stock detection.';
+
+
+
+COMMENT ON COLUMN "public"."bikes"."list_price" IS 'Vendor list (regular) price.';
+
+
+
+COMMENT ON COLUMN "public"."bikes"."special_price" IS 'Vendor promo price; effective only inside [special_from, special_to].';
+
+
+
+COMMENT ON COLUMN "public"."bikes"."raw_specs" IS 'Decoded vendor option attributes (jsonb). Marketing prose + component table stay in description (HTML, no parser).';
+
+
+
+CREATE OR REPLACE FUNCTION "public"."specifications"("b" "public"."bikes") RETURNS "jsonb"
+    LANGUAGE "sql" STABLE
+    AS $$
+  SELECT COALESCE(
+    jsonb_agg(
+      jsonb_build_object('label', s.label, 'value', s.value)
+      ORDER BY s.ord
+    ) FILTER (WHERE NULLIF(btrim(s.value), '') IS NOT NULL),
+    '[]'::jsonb
+  )
+  FROM (VALUES
+    ( 1, 'Supported features', b.supported_features),
+    ( 2, 'Motor',           COALESCE(b.raw_specs ->> 'motorizare',   b.engine)),
+    ( 3, 'Motor power',     b.raw_specs ->> 'putere_motor'),
+    ( 4, 'Gears',           b.raw_specs ->> 'numar_viteze'),
+    ( 5, 'Brakes',          b.raw_specs ->> 'tip_franare'),
+    ( 6, 'Frame material',  COALESCE(b.raw_specs ->> 'material',      b.frame_material)),
+    ( 7, 'Frame size',      COALESCE(b.raw_specs ->> 'marime',        b.frame_size)),
+    ( 8, 'Wheel size',      COALESCE(b.raw_specs ->> 'marime_roata',  b.wheel_size)),
+    ( 9, 'Wheel bandwidth', b.wheel_bandwidth),
+    (10, 'Category',        b.raw_specs ->> 'gen'),
+    (11, 'Color',           b.raw_specs ->> 'color'),
+    (12, 'Lock',            b.lock_type)
+  ) AS s(ord, label, value);
+$$;
+
+
+ALTER FUNCTION "public"."specifications"("b" "public"."bikes") OWNER TO "postgres";
+
+
+COMMENT ON FUNCTION "public"."specifications"("b" "public"."bikes") IS 'Single source of truth for the dynamic Specifications [{label,value}] list. Prefers decoded vendor attributes in raw_specs (synced bikes), falls back to curated columns (legacy bikes); drops empty rows. Excludes keys shown elsewhere (battery→Power, brand) and the internal stock key. Used by the bikes_with_my_pricing view AND exposed by PostgREST as a computed column on bikes (select it explicitly — not included by select=*).';
+
+
+
 CREATE OR REPLACE FUNCTION "public"."sync_avatar_to_profile"() RETURNS "trigger"
     LANGUAGE "plpgsql" SECURITY DEFINER
     AS $$
@@ -984,10 +1635,6 @@ $$;
 
 ALTER FUNCTION "public"."update_updated_at_column"() OWNER TO "postgres";
 
-SET default_tablespace = '';
-
-SET default_table_access_method = "heap";
-
 
 CREATE TABLE IF NOT EXISTS "public"."bike_benefits" (
     "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,
@@ -1090,6 +1737,42 @@ COMMENT ON COLUMN "public"."bike_benefits"."contract_declined_at" IS 'Set by web
 
 
 
+CREATE TABLE IF NOT EXISTS "public"."bike_models" (
+    "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,
+    "dealer_id" "uuid" NOT NULL,
+    "external_parent_sku" "text" NOT NULL,
+    "mpn" "text",
+    "ean" "text",
+    "brand" "text",
+    "name" "text" NOT NULL,
+    "type" "public"."bike_type",
+    "description" "text",
+    "images" "jsonb",
+    "raw_specs" "jsonb",
+    "created_at" timestamp with time zone DEFAULT "now"() NOT NULL,
+    "updated_at" timestamp with time zone DEFAULT "now"() NOT NULL
+);
+
+
+ALTER TABLE "public"."bike_models" OWNER TO "postgres";
+
+
+COMMENT ON TABLE "public"."bike_models" IS 'Shared model facts (parent grain). One row per dealer configurable-parent listing (or standalone-simple singleton). bikes = the per-dealer OFFER under a model. type + in_catalog live here. Phase 1: model columns are duplicated onto bikes and written by the single merge RPC; the join into the catalog view is Phase 2.';
+
+
+
+COMMENT ON COLUMN "public"."bike_models"."external_parent_sku" IS 'Vendor parent SKU (BellaBike configurable parent, or the simple''s own SKU for singletons; legacy Maros rows use "legacy:<bike_id>"). Phase-1 merge key with dealer_id.';
+
+
+
+COMMENT ON COLUMN "public"."bike_models"."mpn" IS 'Manufacturer part number — stored + indexed as the future cross-dealer model-match seam (matching deferred).';
+
+
+
+COMMENT ON COLUMN "public"."bike_models"."ean" IS 'EAN/barcode — stored + indexed as the future cross-dealer model-match seam (matching deferred).';
+
+
+
 CREATE TABLE IF NOT EXISTS "public"."bike_orders" (
     "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,
     "user_id" "uuid" NOT NULL,
@@ -1131,43 +1814,6 @@ COMMENT ON COLUMN "public"."bike_orders"."bike_full_price" IS 'Frozen full price
 
 
 COMMENT ON COLUMN "public"."bike_orders"."frozen_at" IS 'When the snapshot was last refreshed by send-contract.';
-
-
-
-CREATE TABLE IF NOT EXISTS "public"."bikes" (
-    "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,
-    "name" "text" NOT NULL,
-    "created_at" timestamp with time zone DEFAULT "now"() NOT NULL,
-    "updated_at" timestamp with time zone DEFAULT "now"() NOT NULL,
-    "brand" "text",
-    "description" "text",
-    "image_url" "text",
-    "full_price" numeric(10,2) DEFAULT 0 NOT NULL,
-    "employee_price" numeric(10,2),
-    "weight_kg" numeric(5,2),
-    "charge_time_hours" numeric(4,2),
-    "range_max_km" integer,
-    "power_wh" integer,
-    "engine" "text",
-    "supported_features" "text",
-    "frame_material" "text",
-    "frame_size" "text",
-    "wheel_size" "text",
-    "wheel_bandwidth" "text",
-    "lock_type" "text",
-    "sku" "text",
-    "available_for_test" boolean DEFAULT true,
-    "in_stock" boolean DEFAULT true,
-    "type" "public"."bike_type",
-    "images" "jsonb",
-    "dealer_id" "uuid" NOT NULL
-);
-
-
-ALTER TABLE "public"."bikes" OWNER TO "postgres";
-
-
-COMMENT ON COLUMN "public"."bikes"."type" IS 'Type/category of the bike (e.g., e-MTB, e-city, e-touring)';
 
 
 
@@ -1255,7 +1901,8 @@ CREATE TABLE IF NOT EXISTS "public"."profiles" (
     "hire_date" bigint,
     "fcm_token" "text",
     "onboarding_status" boolean DEFAULT false,
-    "profile_image_path" "text"
+    "profile_image_path" "text",
+    "profile_invite_id" "uuid"
 );
 
 
@@ -1279,6 +1926,10 @@ COMMENT ON COLUMN "public"."profiles"."department" IS 'Employee department or te
 
 
 COMMENT ON COLUMN "public"."profiles"."hire_date" IS 'Employee hire date as Unix timestamp in milliseconds';
+
+
+
+COMMENT ON COLUMN "public"."profiles"."profile_invite_id" IS 'Canonical link to the person''s profile_invites row (SSOT person id). Set by handle_user_registration on claim; backfilled here by email match. UNIQUE (one profile per invite) — the cross-provider fork safety net.';
 
 
 
@@ -1318,7 +1969,8 @@ CREATE OR REPLACE VIEW "public"."bikes_with_my_pricing" WITH ("security_invoker"
     "c"."contract_months" AS "employee_contract_month",
     "c"."currency",
     "prices"."employee_price" AS "employee_full_price",
-    "prices"."monthly_employee_price" AS "employee_monthly_price"
+    "prices"."monthly_employee_price" AS "employee_monthly_price",
+    "public"."specifications"("b".*) AS "specifications"
    FROM (((("public"."bikes" "b"
      JOIN "public"."dealers" "d" ON (("d"."id" = "b"."dealer_id")))
      LEFT JOIN "public"."profiles" "me" ON (("me"."user_id" = "auth"."uid"())))
@@ -1329,7 +1981,7 @@ CREATE OR REPLACE VIEW "public"."bikes_with_my_pricing" WITH ("security_invoker"
 ALTER VIEW "public"."bikes_with_my_pricing" OWNER TO "postgres";
 
 
-COMMENT ON VIEW "public"."bikes_with_my_pricing" IS 'Bike catalog with employee-specific pricing and dealer info. Uses auth.uid() to resolve the calling user''s company subsidy and contract terms automatically. Returns all bikes; pricing columns are NULL when the user has no linked company.';
+COMMENT ON VIEW "public"."bikes_with_my_pricing" IS 'Bike catalog with employee-specific pricing and dealer info. Uses auth.uid() to resolve the calling user''s company subsidy and contract terms automatically. Returns all bikes; pricing columns are NULL when the user has no linked company. `specifications` is the dynamic [{label,value}] spec list (public.specifications); General-details columns (weight_kg/charge_time_hours/range_max_km/power_wh) stay separate.';
 
 
 
@@ -1592,7 +2244,7 @@ CREATE OR REPLACE VIEW "public"."profile_invites_with_details" WITH ("security_i
     "pi"."derived_email"
    FROM ((((("public"."profile_invites" "pi"
      LEFT JOIN "public"."companies" "c" ON (("pi"."company_id" = "c"."id")))
-     LEFT JOIN "public"."profiles" "p" ON (("pi"."email" = "p"."email")))
+     LEFT JOIN "public"."profiles" "p" ON (("p"."profile_invite_id" = "pi"."id")))
      LEFT JOIN "public"."bike_benefits" "bb" ON (("p"."user_id" = "bb"."user_id")))
      LEFT JOIN "public"."bikes" "b" ON (("bb"."bike_id" = "b"."id")))
      LEFT JOIN "public"."bike_orders" "bo" ON (("bb"."id" = "bo"."bike_benefit_id")))
@@ -1624,6 +2276,49 @@ ALTER TABLE "public"."role_permissions" ALTER COLUMN "id" ADD GENERATED BY DEFAU
     NO MAXVALUE
     CACHE 1
 );
+
+
+
+CREATE TABLE IF NOT EXISTS "public"."sync_run_cache" (
+    "run_id" "uuid" NOT NULL,
+    "scope" "text" NOT NULL,
+    "payload" "jsonb" NOT NULL,
+    "created_at" timestamp with time zone DEFAULT "now"() NOT NULL
+);
+
+
+ALTER TABLE "public"."sync_run_cache" OWNER TO "postgres";
+
+
+CREATE OR REPLACE VIEW "public"."sync_run_summary" AS
+SELECT
+    NULL::"uuid" AS "id",
+    NULL::"uuid" AS "dealer_id",
+    NULL::"text" AS "mode",
+    NULL::"text" AS "status",
+    NULL::timestamp with time zone AS "started_at",
+    NULL::timestamp with time zone AS "finished_at",
+    NULL::timestamp with time zone AS "watermark_from",
+    NULL::timestamp with time zone AS "watermark_to",
+    NULL::integer AS "n_fetched",
+    NULL::integer AS "n_inserted",
+    NULL::integer AS "n_updated",
+    NULL::integer AS "n_unchanged",
+    NULL::integer AS "n_failed",
+    NULL::integer AS "n_delisted",
+    NULL::integer AS "n_models_upserted",
+    NULL::"text" AS "error",
+    NULL::bigint AS "n_units",
+    NULL::bigint AS "units_succeeded",
+    NULL::bigint AS "units_failed",
+    NULL::bigint AS "units_skipped",
+    NULL::bigint AS "units_pending";
+
+
+ALTER VIEW "public"."sync_run_summary" OWNER TO "postgres";
+
+
+COMMENT ON VIEW "public"."sync_run_summary" IS 'Per-run rollup of BellaBike sync: run counters + unit status tallies. Local verify: select * from sync_run_summary order by started_at desc;';
 
 
 
@@ -1675,8 +2370,23 @@ ALTER TABLE ONLY "public"."bike_benefits"
 
 
 
+ALTER TABLE ONLY "public"."bike_models"
+    ADD CONSTRAINT "bike_models_dealer_parent_sku_key" UNIQUE ("dealer_id", "external_parent_sku");
+
+
+
+ALTER TABLE ONLY "public"."bike_models"
+    ADD CONSTRAINT "bike_models_pkey" PRIMARY KEY ("id");
+
+
+
 ALTER TABLE ONLY "public"."bike_orders"
     ADD CONSTRAINT "bike_orders_pkey" PRIMARY KEY ("id");
+
+
+
+ALTER TABLE ONLY "public"."bikes"
+    ADD CONSTRAINT "bikes_dealer_id_sku_key" UNIQUE ("dealer_id", "sku");
 
 
 
@@ -1770,6 +2480,21 @@ ALTER TABLE ONLY "public"."role_permissions"
 
 
 
+ALTER TABLE ONLY "public"."sync_run_cache"
+    ADD CONSTRAINT "sync_run_cache_pkey" PRIMARY KEY ("run_id", "scope");
+
+
+
+ALTER TABLE ONLY "public"."sync_runs"
+    ADD CONSTRAINT "sync_runs_pkey" PRIMARY KEY ("id");
+
+
+
+ALTER TABLE ONLY "public"."sync_units"
+    ADD CONSTRAINT "sync_units_pkey" PRIMARY KEY ("id");
+
+
+
 ALTER TABLE ONLY "public"."tbi_loan_applications"
     ADD CONSTRAINT "tbi_loan_applications_order_id_key" UNIQUE ("order_id");
 
@@ -1818,6 +2543,18 @@ CREATE INDEX "idx_bike_benefits_user_id" ON "public"."bike_benefits" USING "btre
 
 
 
+CREATE INDEX "idx_bike_models_dealer" ON "public"."bike_models" USING "btree" ("dealer_id");
+
+
+
+CREATE INDEX "idx_bike_models_ean" ON "public"."bike_models" USING "btree" ("ean") WHERE ("ean" IS NOT NULL);
+
+
+
+CREATE INDEX "idx_bike_models_mpn" ON "public"."bike_models" USING "btree" ("mpn") WHERE ("mpn" IS NOT NULL);
+
+
+
 CREATE INDEX "idx_bike_orders_bike_benefit_id" ON "public"."bike_orders" USING "btree" ("bike_benefit_id");
 
 
@@ -1826,7 +2563,15 @@ CREATE INDEX "idx_bike_orders_user_id" ON "public"."bike_orders" USING "btree" (
 
 
 
+CREATE INDEX "idx_bikes_model_id" ON "public"."bikes" USING "btree" ("model_id");
+
+
+
 CREATE INDEX "idx_bikes_name" ON "public"."bikes" USING "btree" ("name");
+
+
+
+CREATE INDEX "idx_bikes_source" ON "public"."bikes" USING "btree" ("source");
 
 
 
@@ -1926,6 +2671,18 @@ CREATE INDEX "idx_profiles_last_name" ON "public"."profiles" USING "btree" ("las
 
 
 
+CREATE INDEX "idx_sync_runs_dealer_status" ON "public"."sync_runs" USING "btree" ("dealer_id", "status", "started_at" DESC);
+
+
+
+CREATE INDEX "idx_sync_units_claim" ON "public"."sync_units" USING "btree" ("run_id", "branch", "status", "created_at");
+
+
+
+CREATE INDEX "idx_sync_units_claimable" ON "public"."sync_units" USING "btree" ("run_id", "branch", "status", "leased_until", "created_at");
+
+
+
 CREATE INDEX "idx_tbi_loan_apps_benefit" ON "public"."tbi_loan_applications" USING "btree" ("bike_benefit_id");
 
 
@@ -1946,7 +2703,43 @@ CREATE UNIQUE INDEX "profile_invites_source_unique" ON "public"."profile_invites
 
 
 
+CREATE UNIQUE INDEX "profiles_profile_invite_unique" ON "public"."profiles" USING "btree" ("profile_invite_id") WHERE ("profile_invite_id" IS NOT NULL);
+
+
+
+CREATE UNIQUE INDEX "uq_sync_units_page" ON "public"."sync_units" USING "btree" ("run_id", "branch", "category_id", "page") WHERE ("kind" = 'rest_page'::"text");
+
+
+
 CREATE UNIQUE INDEX "user_roles_user_role_idx" ON "public"."user_roles" USING "btree" ("user_id", "role");
+
+
+
+CREATE OR REPLACE VIEW "public"."sync_run_summary" AS
+ SELECT "r"."id",
+    "r"."dealer_id",
+    "r"."mode",
+    "r"."status",
+    "r"."started_at",
+    "r"."finished_at",
+    "r"."watermark_from",
+    "r"."watermark_to",
+    "r"."n_fetched",
+    "r"."n_inserted",
+    "r"."n_updated",
+    "r"."n_unchanged",
+    "r"."n_failed",
+    "r"."n_delisted",
+    "r"."n_models_upserted",
+    "r"."error",
+    "count"("u"."id") AS "n_units",
+    "count"("u"."id") FILTER (WHERE ("u"."status" = 'succeeded'::"text")) AS "units_succeeded",
+    "count"("u"."id") FILTER (WHERE ("u"."status" = 'failed'::"text")) AS "units_failed",
+    "count"("u"."id") FILTER (WHERE ("u"."status" = 'skipped'::"text")) AS "units_skipped",
+    "count"("u"."id") FILTER (WHERE ("u"."status" = ANY (ARRAY['enqueued'::"text", 'running'::"text"]))) AS "units_pending"
+   FROM ("public"."sync_runs" "r"
+     LEFT JOIN "public"."sync_units" "u" ON (("u"."run_id" = "r"."id")))
+  GROUP BY "r"."id";
 
 
 
@@ -1959,6 +2752,10 @@ CREATE OR REPLACE TRIGGER "update_benefit_status_on_change" BEFORE INSERT OR UPD
 
 
 CREATE OR REPLACE TRIGGER "update_bike_benefits_updated_at" BEFORE UPDATE ON "public"."bike_benefits" FOR EACH ROW EXECUTE FUNCTION "public"."update_updated_at_column"();
+
+
+
+CREATE OR REPLACE TRIGGER "update_bike_models_updated_at" BEFORE UPDATE ON "public"."bike_models" FOR EACH ROW EXECUTE FUNCTION "public"."update_updated_at_column"();
 
 
 
@@ -2000,6 +2797,11 @@ ALTER TABLE ONLY "public"."bike_benefits"
 
 
 
+ALTER TABLE ONLY "public"."bike_models"
+    ADD CONSTRAINT "bike_models_dealer_id_fkey" FOREIGN KEY ("dealer_id") REFERENCES "public"."dealers"("id");
+
+
+
 ALTER TABLE ONLY "public"."bike_orders"
     ADD CONSTRAINT "bike_orders_bike_benefit_id_fkey" FOREIGN KEY ("bike_benefit_id") REFERENCES "public"."bike_benefits"("id") ON DELETE CASCADE;
 
@@ -2017,6 +2819,11 @@ ALTER TABLE ONLY "public"."bike_orders"
 
 ALTER TABLE ONLY "public"."bikes"
     ADD CONSTRAINT "bikes_dealer_id_fkey" FOREIGN KEY ("dealer_id") REFERENCES "public"."dealers"("id");
+
+
+
+ALTER TABLE ONLY "public"."bikes"
+    ADD CONSTRAINT "bikes_model_id_fkey" FOREIGN KEY ("model_id") REFERENCES "public"."bike_models"("id") ON DELETE RESTRICT;
 
 
 
@@ -2091,7 +2898,27 @@ ALTER TABLE ONLY "public"."profiles"
 
 
 ALTER TABLE ONLY "public"."profiles"
+    ADD CONSTRAINT "profiles_profile_invite_id_fkey" FOREIGN KEY ("profile_invite_id") REFERENCES "public"."profile_invites"("id") ON DELETE SET NULL;
+
+
+
+ALTER TABLE ONLY "public"."profiles"
     ADD CONSTRAINT "profiles_user_id_fkey" FOREIGN KEY ("user_id") REFERENCES "auth"."users"("id") ON DELETE CASCADE;
+
+
+
+ALTER TABLE ONLY "public"."sync_run_cache"
+    ADD CONSTRAINT "sync_run_cache_run_id_fkey" FOREIGN KEY ("run_id") REFERENCES "public"."sync_runs"("id") ON DELETE CASCADE;
+
+
+
+ALTER TABLE ONLY "public"."sync_runs"
+    ADD CONSTRAINT "sync_runs_dealer_id_fkey" FOREIGN KEY ("dealer_id") REFERENCES "public"."dealers"("id");
+
+
+
+ALTER TABLE ONLY "public"."sync_units"
+    ADD CONSTRAINT "sync_units_run_id_fkey" FOREIGN KEY ("run_id") REFERENCES "public"."sync_runs"("id") ON DELETE CASCADE;
 
 
 
@@ -2180,6 +3007,13 @@ CREATE POLICY "bike_benefits_hr_select" ON "public"."bike_benefits" FOR SELECT T
 
 
 CREATE POLICY "bike_benefits_hr_update" ON "public"."bike_benefits" FOR UPDATE TO "authenticated" USING ((("auth"."jwt"() ->> 'user_role'::"text") = ANY (ARRAY['hr'::"text", 'admin'::"text"])));
+
+
+
+ALTER TABLE "public"."bike_models" ENABLE ROW LEVEL SECURITY;
+
+
+CREATE POLICY "bike_models_authenticated_select" ON "public"."bike_models" FOR SELECT TO "authenticated" USING (true);
 
 
 
@@ -2320,6 +3154,23 @@ CREATE POLICY "profiles_self_update" ON "public"."profiles" FOR UPDATE TO "authe
 ALTER TABLE "public"."role_permissions" ENABLE ROW LEVEL SECURITY;
 
 
+ALTER TABLE "public"."sync_run_cache" ENABLE ROW LEVEL SECURITY;
+
+
+ALTER TABLE "public"."sync_runs" ENABLE ROW LEVEL SECURITY;
+
+
+CREATE POLICY "sync_runs_authenticated_select" ON "public"."sync_runs" FOR SELECT TO "authenticated" USING (true);
+
+
+
+ALTER TABLE "public"."sync_units" ENABLE ROW LEVEL SECURITY;
+
+
+CREATE POLICY "sync_units_authenticated_select" ON "public"."sync_units" FOR SELECT TO "authenticated" USING (true);
+
+
+
 ALTER TABLE "public"."tbi_loan_applications" ENABLE ROW LEVEL SECURITY;
 
 
@@ -2362,6 +3213,9 @@ ALTER PUBLICATION "supabase_realtime" ADD TABLE ONLY "public"."company_notificat
 
 
 ALTER PUBLICATION "supabase_realtime" ADD TABLE ONLY "public"."profiles";
+
+
+
 
 
 
@@ -2537,6 +3391,27 @@ GRANT ALL ON FUNCTION "public"."gtrgm_out"("public"."gtrgm") TO "service_role";
 
 
 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 GRANT ALL ON FUNCTION "public"."auth_company_id"() TO "anon";
 GRANT ALL ON FUNCTION "public"."auth_company_id"() TO "authenticated";
 GRANT ALL ON FUNCTION "public"."auth_company_id"() TO "service_role";
@@ -2546,6 +3421,24 @@ GRANT ALL ON FUNCTION "public"."auth_company_id"() TO "service_role";
 GRANT ALL ON FUNCTION "public"."authorize"("requested_permission" "public"."user_role_permissions") TO "anon";
 GRANT ALL ON FUNCTION "public"."authorize"("requested_permission" "public"."user_role_permissions") TO "authenticated";
 GRANT ALL ON FUNCTION "public"."authorize"("requested_permission" "public"."user_role_permissions") TO "service_role";
+
+
+
+GRANT ALL ON FUNCTION "public"."bike_sync_invoke"("p_run_id" "uuid", "p_branch" "text") TO "anon";
+GRANT ALL ON FUNCTION "public"."bike_sync_invoke"("p_run_id" "uuid", "p_branch" "text") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."bike_sync_invoke"("p_run_id" "uuid", "p_branch" "text") TO "service_role";
+
+
+
+GRANT ALL ON FUNCTION "public"."bike_sync_kickoff"("p_mode" "text", "p_categories" "text"[]) TO "anon";
+GRANT ALL ON FUNCTION "public"."bike_sync_kickoff"("p_mode" "text", "p_categories" "text"[]) TO "authenticated";
+GRANT ALL ON FUNCTION "public"."bike_sync_kickoff"("p_mode" "text", "p_categories" "text"[]) TO "service_role";
+
+
+
+GRANT ALL ON FUNCTION "public"."bike_sync_tick"() TO "anon";
+GRANT ALL ON FUNCTION "public"."bike_sync_tick"() TO "authenticated";
+GRANT ALL ON FUNCTION "public"."bike_sync_tick"() TO "service_role";
 
 
 
@@ -2561,9 +3454,45 @@ GRANT ALL ON FUNCTION "public"."calculate_employee_bike_price"("p_full_price" nu
 
 
 
+GRANT ALL ON TABLE "public"."sync_units" TO "anon";
+GRANT ALL ON TABLE "public"."sync_units" TO "authenticated";
+GRANT ALL ON TABLE "public"."sync_units" TO "service_role";
+
+
+
+GRANT ALL ON FUNCTION "public"."claim_next_sync_unit"("p_run_id" "uuid", "p_branch" "text", "p_lease_seconds" integer) TO "anon";
+GRANT ALL ON FUNCTION "public"."claim_next_sync_unit"("p_run_id" "uuid", "p_branch" "text", "p_lease_seconds" integer) TO "authenticated";
+GRANT ALL ON FUNCTION "public"."claim_next_sync_unit"("p_run_id" "uuid", "p_branch" "text", "p_lease_seconds" integer) TO "service_role";
+
+
+
+GRANT ALL ON FUNCTION "public"."complete_sync_unit"("p_unit_id" "uuid", "p_status" "text", "p_n_fetched" integer, "p_n_inserted" integer, "p_n_updated" integer, "p_n_models" integer, "p_n_failed" integer, "p_error" "text") TO "anon";
+GRANT ALL ON FUNCTION "public"."complete_sync_unit"("p_unit_id" "uuid", "p_status" "text", "p_n_fetched" integer, "p_n_inserted" integer, "p_n_updated" integer, "p_n_models" integer, "p_n_failed" integer, "p_error" "text") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."complete_sync_unit"("p_unit_id" "uuid", "p_status" "text", "p_n_fetched" integer, "p_n_inserted" integer, "p_n_updated" integer, "p_n_models" integer, "p_n_failed" integer, "p_error" "text") TO "service_role";
+
+
+
 REVOKE ALL ON FUNCTION "public"."custom_access_token_hook"("event" "jsonb") FROM PUBLIC;
 GRANT ALL ON FUNCTION "public"."custom_access_token_hook"("event" "jsonb") TO "service_role";
 GRANT ALL ON FUNCTION "public"."custom_access_token_hook"("event" "jsonb") TO "supabase_auth_admin";
+
+
+
+GRANT ALL ON FUNCTION "public"."enqueue_page_units"("p_run_id" "uuid", "p_category_id" "text", "p_total" integer, "p_page_size" integer) TO "anon";
+GRANT ALL ON FUNCTION "public"."enqueue_page_units"("p_run_id" "uuid", "p_category_id" "text", "p_total" integer, "p_page_size" integer) TO "authenticated";
+GRANT ALL ON FUNCTION "public"."enqueue_page_units"("p_run_id" "uuid", "p_category_id" "text", "p_total" integer, "p_page_size" integer) TO "service_role";
+
+
+
+GRANT ALL ON TABLE "public"."sync_runs" TO "anon";
+GRANT ALL ON TABLE "public"."sync_runs" TO "authenticated";
+GRANT ALL ON TABLE "public"."sync_runs" TO "service_role";
+
+
+
+GRANT ALL ON FUNCTION "public"."finalize_sync_run"("p_run_id" "uuid") TO "anon";
+GRANT ALL ON FUNCTION "public"."finalize_sync_run"("p_run_id" "uuid") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."finalize_sync_run"("p_run_id" "uuid") TO "service_role";
 
 
 
@@ -2700,6 +3629,18 @@ GRANT ALL ON FUNCTION "public"."match_pending_invite"("p_company_id" "uuid", "p_
 
 
 
+GRANT ALL ON FUNCTION "public"."merge_bike_offers"("p_dealer_id" "uuid", "p_models" "jsonb") TO "anon";
+GRANT ALL ON FUNCTION "public"."merge_bike_offers"("p_dealer_id" "uuid", "p_models" "jsonb") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."merge_bike_offers"("p_dealer_id" "uuid", "p_models" "jsonb") TO "service_role";
+
+
+
+GRANT ALL ON FUNCTION "public"."seed_audit_units"("p_run_id" "uuid") TO "anon";
+GRANT ALL ON FUNCTION "public"."seed_audit_units"("p_run_id" "uuid") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."seed_audit_units"("p_run_id" "uuid") TO "service_role";
+
+
+
 GRANT ALL ON FUNCTION "public"."set_limit"(real) TO "postgres";
 GRANT ALL ON FUNCTION "public"."set_limit"(real) TO "anon";
 GRANT ALL ON FUNCTION "public"."set_limit"(real) TO "authenticated";
@@ -2739,6 +3680,18 @@ GRANT ALL ON FUNCTION "public"."similarity_op"("text", "text") TO "postgres";
 GRANT ALL ON FUNCTION "public"."similarity_op"("text", "text") TO "anon";
 GRANT ALL ON FUNCTION "public"."similarity_op"("text", "text") TO "authenticated";
 GRANT ALL ON FUNCTION "public"."similarity_op"("text", "text") TO "service_role";
+
+
+
+GRANT ALL ON TABLE "public"."bikes" TO "anon";
+GRANT ALL ON TABLE "public"."bikes" TO "authenticated";
+GRANT ALL ON TABLE "public"."bikes" TO "service_role";
+
+
+
+GRANT ALL ON FUNCTION "public"."specifications"("b" "public"."bikes") TO "anon";
+GRANT ALL ON FUNCTION "public"."specifications"("b" "public"."bikes") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."specifications"("b" "public"."bikes") TO "service_role";
 
 
 
@@ -2857,21 +3810,27 @@ GRANT ALL ON FUNCTION "public"."word_similarity_op"("text", "text") TO "service_
 
 
 
+
+
+
+
+
+
 GRANT ALL ON TABLE "public"."bike_benefits" TO "anon";
 GRANT ALL ON TABLE "public"."bike_benefits" TO "authenticated";
 GRANT ALL ON TABLE "public"."bike_benefits" TO "service_role";
 
 
 
+GRANT ALL ON TABLE "public"."bike_models" TO "anon";
+GRANT ALL ON TABLE "public"."bike_models" TO "authenticated";
+GRANT ALL ON TABLE "public"."bike_models" TO "service_role";
+
+
+
 GRANT ALL ON TABLE "public"."bike_orders" TO "anon";
 GRANT ALL ON TABLE "public"."bike_orders" TO "authenticated";
 GRANT ALL ON TABLE "public"."bike_orders" TO "service_role";
-
-
-
-GRANT ALL ON TABLE "public"."bikes" TO "anon";
-GRANT ALL ON TABLE "public"."bikes" TO "authenticated";
-GRANT ALL ON TABLE "public"."bikes" TO "service_role";
 
 
 
@@ -2956,6 +3915,18 @@ GRANT ALL ON TABLE "public"."role_permissions" TO "service_role";
 GRANT ALL ON SEQUENCE "public"."role_permissions_id_seq" TO "anon";
 GRANT ALL ON SEQUENCE "public"."role_permissions_id_seq" TO "authenticated";
 GRANT ALL ON SEQUENCE "public"."role_permissions_id_seq" TO "service_role";
+
+
+
+GRANT ALL ON TABLE "public"."sync_run_cache" TO "anon";
+GRANT ALL ON TABLE "public"."sync_run_cache" TO "authenticated";
+GRANT ALL ON TABLE "public"."sync_run_cache" TO "service_role";
+
+
+
+GRANT ALL ON TABLE "public"."sync_run_summary" TO "anon";
+GRANT ALL ON TABLE "public"."sync_run_summary" TO "authenticated";
+GRANT ALL ON TABLE "public"."sync_run_summary" TO "service_role";
 
 
 

@@ -58,7 +58,10 @@ export function makeRestClient(supabaseUrl: string, serviceKey: string): RestCli
       headers: baseHeaders,
       body: JSON.stringify(args),
     })
-    return res.json()
+    // VOID-returning functions (e.g. seed_audit_units) reply with an empty body;
+    // parsing that as JSON throws. Treat empty as null.
+    const text = await res.text()
+    return (text ? JSON.parse(text) : null) as T
   }
 
   return { getOne, post, upsert, patch, rpc }

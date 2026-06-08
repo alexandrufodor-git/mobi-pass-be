@@ -66,6 +66,7 @@ interface Bike {
   charge_time_hours: number | null
   range_max_km: number | null
   power_wh: number | null
+  specifications: Array<{ label: string; value: string }> | null
 }
 
 interface Contract {
@@ -179,7 +180,9 @@ Deno.serve(async (req) => {
         ? db.getOne<Bike>(
             "bikes",
             `id=eq.${benefit.bike_id}`,
-            "name,brand,images,weight_kg,charge_time_hours,range_max_km,power_wh"
+            // `specifications` is a PostgREST computed column (public.specifications)
+            // → selected explicitly; the same dynamic [{label,value}] list clients render.
+            "name,brand,images,weight_kg,charge_time_hours,range_max_km,power_wh,specifications"
           )
         : null,
       benefit
@@ -269,6 +272,7 @@ Deno.serve(async (req) => {
       charge_time_hours:        bike?.charge_time_hours ?? null,
       range_max_km:             bike?.range_max_km ?? null,
       power_wh:                 bike?.power_wh ?? null,
+      specifications:           bike?.specifications ?? [],
 
       sign_page_url:            contract?.sign_page_url ?? null,
       helmet:                   bikeOrder?.helmet ?? null,

@@ -1,6 +1,12 @@
 # macOS
 .DS_Store
 
+# Local AI agent state (Claude Code / Cursor) — machine-local working memory,
+# never source. Tracked content under .claude/ (e.g. skill eval workspaces) is
+# unaffected; only the agent-memory dirs are ignored.
+.claude/agent-memory/
+scripts/dev/.claude/
+
 # Supabase
 .branches
 .temp
@@ -16,6 +22,18 @@
 # keys). The .example template is still tracked because its filename ends in
 # .example, not .env.
 scripts/dev/*.env
+
+# BellaBike read-only data tool (scripts/dev/bellabike.py) generated outputs —
+# regenerable catalog snapshots, not source. The tool itself (bellabike.py +
+# README-bellabike.md) is tracked.
+scripts/dev/bb-*.json
+scripts/dev/bb-*.jsonl
+scripts/dev/bb-comparison.md
+scripts/dev/p_strike.html
+scripts/dev/__pycache__/
+# Full catalog dumps + one-off storefront-audit script (regenerable via
+# bellabike.py); the CSV/JSON exports alone are ~40 MB.
+scripts/dev/export/
 
 # REGES JSON used to seed the single E2E account (contains a valid-format
 # Romanian CNP). Loaded into local Vault by scripts/setup-e2e-vault.sh; prod

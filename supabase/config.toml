@@ -470,3 +470,11 @@ enabled = true
 verify_jwt = false
 import_map = "./functions/e2e-otp/deno.json"
 entrypoint = "./functions/e2e-otp/index.ts"
+
+# BellaBike read-only eBike sync worker. Invoked by pg_cron via pg_net
+# (bike_sync_invoke); gated by the Vault webhook secret bike_sync_webhook_secret.
+[functions.bike-sync]
+enabled = true
+verify_jwt = false
+import_map = "./functions/bike-sync/deno.json"
+entrypoint = "./functions/bike-sync/index.ts"
