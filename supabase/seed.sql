@@ -162,6 +162,20 @@ INSERT INTO public.user_roles (user_id, role) VALUES
   ('dddddddd-dddd-dddd-dddd-dddddddddddd'::uuid, 'hr');
 
 -- ============================================================================
+-- Link seeded profiles to their invite (canonical profile_invite_id)
+-- ============================================================================
+-- handle_user_registration sets profiles.profile_invite_id on real OTP signups,
+-- and profile_invites_with_details now FK-joins on it. Seed profiles are
+-- inserted directly (trigger bypassed), so mirror the migration's email-match
+-- backfill here to keep the HR dashboard view linked in local dev.
+UPDATE public.profiles p
+SET    profile_invite_id = pi.id
+FROM   public.profile_invites pi
+WHERE  pi.email IS NOT NULL
+  AND  lower(pi.email) = lower(p.email)
+  AND  p.profile_invite_id IS NULL;
+
+-- ============================================================================
 -- Notes for Testing
 -- ============================================================================
 -- To test the register flow locally:

@@ -19,11 +19,17 @@
 #                                  claim a personal benefit; bike_benefits
 #                                  RLS keys off user_id=auth.uid(), so this
 #                                  works regardless of the role flip below).
-#   5. user_roles UPDATE         — flip role 'employee' → 'hr'. JWT
-#                                  custom_access_token_hook selects a single
-#                                  row from user_roles, so we keep one row
-#                                  with role='hr' rather than adding a second
-#                                  (non-deterministic which would win otherwise).
+#   5. user_roles ADD 'hr'       — add a second row role='hr' while KEEPING the
+#                                  trigger's role='employee' row, so the HR user
+#                                  holds BOTH roles. This is required: an HR who
+#                                  is also an employee must be able to sign their
+#                                  own bike contract (send-contract gates on a
+#                                  role='employee' row in user_roles). Safe since
+#                                  Migration B (20260608000002): the JWT
+#                                  custom_access_token_hook now picks the
+#                                  highest-priv role deterministically
+#                                  (admin>hr>employee) and emits the full
+#                                  user_roles array — no longer non-deterministic.
 #
 # Usage:
 #   Option A — edit the local config and just run the script:
@@ -411,22 +417,28 @@ cleanup_on_error() {
 }
 trap cleanup_on_error ERR
 
-# ── 4. Flip user_role employee → hr ─────────────────────────────────────────
+# ── 4. Add 'hr' role (keep the trigger's 'employee' row) ────────────────────
+# The user ends up with BOTH user_roles rows: 'employee' (from the trigger) and
+# 'hr' (added here). send-contract requires a role='employee' row, so an HR who
+# also claims a personal bike benefit can sign their own contract. The JWT hook
+# (Migration B) reports highest-priv ('hr') as user_role and the full set as the
+# user_roles array. Use Prefer: resolution=merge-duplicates so re-runs against a
+# re-created user are idempotent against the (user_id, role) unique index.
 
-echo "[4/5] Promoting role employee → hr..."
-ROLE_PATCH_RESP=$(curl -sS -X PATCH \
-  "$SUPABASE_URL/rest/v1/user_roles?user_id=eq.$USER_ID&role=eq.employee" \
+echo "[4/5] Adding 'hr' role (keeping 'employee')..."
+ROLE_POST_RESP=$(curl -sS -X POST \
+  "$SUPABASE_URL/rest/v1/user_roles" \
   -H "apikey: $SUPABASE_SERVICE_ROLE_KEY" \
   -H "Authorization: Bearer $SUPABASE_SERVICE_ROLE_KEY" \
   -H "Content-Type: application/json" \
-  -H "Prefer: return=representation" \
-  -d '{"role":"hr"}')
-if ! echo "$ROLE_PATCH_RESP" | jq -e '.[0].id' > /dev/null 2>&1; then
-  echo "✗ role flip failed:" >&2
-  echo "$ROLE_PATCH_RESP" >&2
+  -H "Prefer: return=representation,resolution=merge-duplicates" \
+  -d "$(jq -nc --arg uid "$USER_ID" '{user_id: $uid, role: "hr"}')")
+if ! echo "$ROLE_POST_RESP" | jq -e '.[0].id' > /dev/null 2>&1; then
+  echo "✗ hr role insert failed:" >&2
+  echo "$ROLE_POST_RESP" >&2
   exit 1
 fi
-echo "      ✓ role=hr"
+echo "      ✓ roles: employee + hr"
 
 # ── 5. Patch HR's profile (department, names) ───────────────────────────────
 # The trigger copies first/last from the invite, so this is just to set the
@@ -482,7 +494,7 @@ Email domain:  $EMAIL_DOMAIN
 HR account:
   Email:       $HR_EMAIL
   Password:    $HR_PASSWORD
-  Role:        hr
+  Roles:       employee + hr (can sign own contract via send-contract)
   User ID:     $USER_ID
 
 Save the password — it isn't recoverable from this script.
