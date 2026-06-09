@@ -185,7 +185,8 @@ ALTER TYPE "public"."tbi_loan_status" OWNER TO "postgres";
 
 CREATE TYPE "public"."user_profile_status" AS ENUM (
     'active',
-    'inactive'
+    'inactive',
+    'pending_sso_claim'
 );
 
 
@@ -822,103 +823,249 @@ CREATE OR REPLACE FUNCTION "public"."handle_user_registration"() RETURNS "trigge
     LANGUAGE "plpgsql" SECURITY DEFINER
     AS $$
 DECLARE
-  v_company_id  uuid;
-  v_first_name  text;
-  v_last_name   text;
-  v_description text;
-  v_department  text;
-  v_hire_date   bigint;
-  v_invite_id   uuid;
+  v_provider        text;
+  v_hd              text;
+  v_email_domain    text;
+  v_company_id      uuid;
+  v_sso_kind        text;
+  v_sso_hd_required boolean;
+  v_matched_via     text;
+  v_first_name      text;
+  v_last_name       text;
+  v_description     text;
+  v_department      text;
+  v_hire_date       bigint;
+  v_invite_id       uuid;
 BEGIN
-  IF NEW.email_confirmed_at IS NOT NULL THEN
+  IF NEW.email_confirmed_at IS NULL THEN
+    RETURN NEW;
+  END IF;
 
-    -- 1. Resolve company_id and employee fields from profile_invites.
-    --    Match on email OR derived_email; prefer the exact-email invite.
-    SELECT
-      pi.id,
-      pi.company_id,
-      pi.first_name,
-      pi.last_name,
-      pi.description,
-      pi.department,
-      pi.hire_date
-    INTO
-      v_invite_id,
-      v_company_id,
-      v_first_name,
-      v_last_name,
-      v_description,
-      v_department,
-      v_hire_date
-    FROM public.profile_invites pi
-    WHERE LOWER(pi.email) = LOWER(NEW.email)
-       OR LOWER(pi.derived_email) = LOWER(NEW.email)
-    ORDER BY (LOWER(pi.email) = LOWER(NEW.email)) DESC NULLS LAST
-    LIMIT 1;
+  v_provider := COALESCE(NEW.raw_app_meta_data->>'provider', 'email');
+
+  -- ============================================================
+  -- Google OIDC user (NEW). Everything else falls through to the
+  -- existing email/OTP/password logic below, unchanged.
+  -- ============================================================
+  IF v_provider = 'google' THEN
+    v_hd           := NEW.raw_user_meta_data->>'hd';
+    v_email_domain := lower(split_part(NEW.email, '@', 2));
+
+    -- Resolve the SSO-enabled company. Prefer the hd claim (the true Workspace
+    -- domain); fall back to the email domain only when hd is absent.
+    SELECT id, sso_kind, sso_hd_required
+      INTO v_company_id, v_sso_kind, v_sso_hd_required
+      FROM public.companies
+     WHERE lower(email_domain) = COALESCE(lower(v_hd), v_email_domain)
+       AND sso_kind = 'google_oidc'
+     LIMIT 1;
 
     IF v_company_id IS NULL THEN
-      RAISE EXCEPTION 'No active invite found for email %', NEW.email;
+      RAISE EXCEPTION 'SSO_DOMAIN_NOT_AUTHORIZED: % / hd=%', NEW.email, COALESCE(v_hd, '<none>');
     END IF;
 
-    -- 2. Create or update profile (must exist before user_roles FK insert).
-    --    profile_invite_id stamps the canonical person link.
-    INSERT INTO public.profiles (
-      user_id, email, status, company_id,
-      first_name, last_name, description, department, hire_date,
-      profile_invite_id
-    )
+    IF v_sso_hd_required AND v_hd IS NULL THEN
+      RAISE EXCEPTION 'SSO_HD_REQUIRED: % missing hd claim (personal Google account?)', NEW.email;
+    END IF;
+
+    IF v_sso_hd_required AND lower(v_hd) <> v_email_domain THEN
+      RAISE EXCEPTION 'SSO_HD_EMAIL_MISMATCH: email domain % does not match hd %', v_email_domain, v_hd;
+    END IF;
+
+    -- Match an invite by email OR derived_email, scoped to this company.
+    -- Prefer the exact-email invite (deterministic). REGES-staged rows have
+    -- email NULL but derived_email set — this is how SSO auto-links them.
+    SELECT pi.id, pi.first_name, pi.last_name, pi.description, pi.department, pi.hire_date,
+           CASE WHEN LOWER(pi.email) = LOWER(NEW.email) THEN 'email' ELSE 'derived_email' END
+      INTO v_invite_id, v_first_name, v_last_name, v_description, v_department, v_hire_date,
+           v_matched_via
+      FROM public.profile_invites pi
+     WHERE pi.company_id = v_company_id
+       AND (LOWER(pi.email) = LOWER(NEW.email) OR LOWER(pi.derived_email) = LOWER(NEW.email))
+     ORDER BY (LOWER(pi.email) = LOWER(NEW.email)) DESC NULLS LAST
+     LIMIT 1;
+
+    IF v_invite_id IS NOT NULL THEN
+      -- Matched → full onboarding, mirroring the email branch.
+      INSERT INTO public.profiles (
+        user_id, email, status, company_id,
+        first_name, last_name, description, department, hire_date,
+        profile_invite_id
+      )
+      VALUES (
+        NEW.id, NEW.email, 'active'::public.user_profile_status, v_company_id,
+        v_first_name, v_last_name, v_description, v_department, v_hire_date,
+        v_invite_id
+      )
+      ON CONFLICT (user_id) DO UPDATE SET
+        email             = EXCLUDED.email,
+        status            = 'active'::public.user_profile_status,
+        company_id        = EXCLUDED.company_id,
+        first_name        = EXCLUDED.first_name,
+        last_name         = EXCLUDED.last_name,
+        description       = EXCLUDED.description,
+        department        = EXCLUDED.department,
+        hire_date         = EXCLUDED.hire_date,
+        profile_invite_id = EXCLUDED.profile_invite_id;
+
+      INSERT INTO public.user_roles (user_id, role)
+      VALUES (NEW.id, 'employee'::public.user_role)
+      ON CONFLICT (user_id, role) DO NOTHING;
+
+      -- Flip invite to active; if matched via derived_email, bind its email to
+      -- the verified Google email so the invite is no longer "pending" and
+      -- downstream joins are stable.
+      UPDATE public.profile_invites
+         SET status = 'active'::public.user_profile_status,
+             email  = CASE WHEN v_matched_via = 'derived_email' THEN NEW.email ELSE email END
+       WHERE id = v_invite_id;
+
+      -- Step 4.5: backfill staged REGES PII (mirrors the email branch).
+      UPDATE public.employee_pii
+         SET user_id    = NEW.id,
+             updated_at = now()
+       WHERE profile_invite_id = v_invite_id
+         AND user_id IS NULL;
+
+      INSERT INTO public.bike_benefits (user_id)
+      VALUES (NEW.id)
+      ON CONFLICT DO NOTHING;
+
+      INSERT INTO public.company_notifications (company_id, event, event_type, payload)
+      VALUES (
+        v_company_id, 'user_update', 'created',
+        jsonb_build_object(
+          'user_id',       NEW.id,
+          'employee_name', v_first_name || ' ' || v_last_name,
+          'auth_provider', 'google',
+          'matched_via',   v_matched_via
+        )
+      );
+
+      RETURN NEW;
+    END IF;
+
+    -- No invite match → pending claim. NO role, NO benefit, NO PII link.
+    -- profiles.first_name/last_name are NOT NULL; a Google user carries their
+    -- name in the ID token (given_name/family_name, stored in raw_user_meta_data),
+    -- so use that, falling back to the name claim then the email local-part.
+    -- These are placeholders only — promote_sso_claim overwrites them from the
+    -- matched invite once the claim is approved.
+    INSERT INTO public.profiles (user_id, email, status, company_id, first_name, last_name)
     VALUES (
-      NEW.id, NEW.email, 'active'::public.user_profile_status, v_company_id,
-      v_first_name, v_last_name, v_description, v_department, v_hire_date,
-      v_invite_id
+      NEW.id, NEW.email, 'pending_sso_claim'::public.user_profile_status, v_company_id,
+      COALESCE(NULLIF(NEW.raw_user_meta_data->>'given_name', ''),
+               NULLIF(NEW.raw_user_meta_data->>'name', ''),
+               split_part(NEW.email, '@', 1)),
+      COALESCE(NULLIF(NEW.raw_user_meta_data->>'family_name', ''), '')
     )
     ON CONFLICT (user_id) DO UPDATE SET
-      email             = EXCLUDED.email,
-      status            = 'active'::public.user_profile_status,
-      company_id        = EXCLUDED.company_id,
-      first_name        = EXCLUDED.first_name,
-      last_name         = EXCLUDED.last_name,
-      description       = EXCLUDED.description,
-      department        = EXCLUDED.department,
-      hire_date         = EXCLUDED.hire_date,
-      profile_invite_id = EXCLUDED.profile_invite_id;
+      email      = EXCLUDED.email,
+      status     = 'pending_sso_claim'::public.user_profile_status,
+      company_id = EXCLUDED.company_id;
 
-    -- 3. Assign 'employee' role
-    INSERT INTO public.user_roles (user_id, role)
-    VALUES (NEW.id, 'employee'::public.user_role)
-    ON CONFLICT (user_id, role) DO NOTHING;
-
-    -- 4. Update profile_invites status (by id — covers derived-email matches
-    --    where email may be NULL on the invite).
-    UPDATE public.profile_invites
-    SET status = 'active'::public.user_profile_status
-    WHERE id = v_invite_id;
-
-    -- 4.5. Link any pending REGES PII to this user
-    UPDATE public.employee_pii
-       SET user_id    = NEW.id,
-           updated_at = now()
-     WHERE profile_invite_id = v_invite_id
-       AND user_id IS NULL;
-
-    -- 5. Create bike benefit
-    INSERT INTO public.bike_benefits (user_id)
-    VALUES (NEW.id)
+    INSERT INTO public.sso_pending_claims (user_id, company_id, email, hd, status)
+    VALUES (NEW.id, v_company_id, NEW.email, v_hd, 'awaiting_user_info')
     ON CONFLICT DO NOTHING;
 
-    -- 6. Insert notification — Realtime postgres_changes delivers it to HR dashboard
     INSERT INTO public.company_notifications (company_id, event, event_type, payload)
     VALUES (
-      v_company_id,
-      'user_update',
-      'created',
-      jsonb_build_object(
-        'user_id',       NEW.id,
-        'employee_name', v_first_name || ' ' || v_last_name
-      )
+      v_company_id, 'user_update', 'sso_claim_pending',
+      jsonb_build_object('user_id', NEW.id, 'email', NEW.email, 'hd', v_hd)
     );
 
+    RETURN NEW;
   END IF;
+
+  -- ============================================================
+  -- email / OTP / password user — VERBATIM from the shipped body.
+  -- ============================================================
+
+  -- 1. Resolve company_id and employee fields from profile_invites.
+  --    Match on email OR derived_email; prefer the exact-email invite.
+  SELECT
+    pi.id,
+    pi.company_id,
+    pi.first_name,
+    pi.last_name,
+    pi.description,
+    pi.department,
+    pi.hire_date
+  INTO
+    v_invite_id,
+    v_company_id,
+    v_first_name,
+    v_last_name,
+    v_description,
+    v_department,
+    v_hire_date
+  FROM public.profile_invites pi
+  WHERE LOWER(pi.email) = LOWER(NEW.email)
+     OR LOWER(pi.derived_email) = LOWER(NEW.email)
+  ORDER BY (LOWER(pi.email) = LOWER(NEW.email)) DESC NULLS LAST
+  LIMIT 1;
+
+  IF v_company_id IS NULL THEN
+    RAISE EXCEPTION 'No active invite found for email %', NEW.email;
+  END IF;
+
+  -- 2. Create or update profile (must exist before user_roles FK insert).
+  --    profile_invite_id stamps the canonical person link.
+  INSERT INTO public.profiles (
+    user_id, email, status, company_id,
+    first_name, last_name, description, department, hire_date,
+    profile_invite_id
+  )
+  VALUES (
+    NEW.id, NEW.email, 'active'::public.user_profile_status, v_company_id,
+    v_first_name, v_last_name, v_description, v_department, v_hire_date,
+    v_invite_id
+  )
+  ON CONFLICT (user_id) DO UPDATE SET
+    email             = EXCLUDED.email,
+    status            = 'active'::public.user_profile_status,
+    company_id        = EXCLUDED.company_id,
+    first_name        = EXCLUDED.first_name,
+    last_name         = EXCLUDED.last_name,
+    description       = EXCLUDED.description,
+    department        = EXCLUDED.department,
+    hire_date         = EXCLUDED.hire_date,
+    profile_invite_id = EXCLUDED.profile_invite_id;
+
+  -- 3. Assign 'employee' role
+  INSERT INTO public.user_roles (user_id, role)
+  VALUES (NEW.id, 'employee'::public.user_role)
+  ON CONFLICT (user_id, role) DO NOTHING;
+
+  -- 4. Update profile_invites status (by id — covers derived-email matches
+  --    where email may be NULL on the invite).
+  UPDATE public.profile_invites
+  SET status = 'active'::public.user_profile_status
+  WHERE id = v_invite_id;
+
+  -- 4.5. Link any pending REGES PII to this user
+  UPDATE public.employee_pii
+     SET user_id    = NEW.id,
+         updated_at = now()
+   WHERE profile_invite_id = v_invite_id
+     AND user_id IS NULL;
+
+  -- 5. Create bike benefit
+  INSERT INTO public.bike_benefits (user_id)
+  VALUES (NEW.id)
+  ON CONFLICT DO NOTHING;
+
+  -- 6. Insert notification — Realtime postgres_changes delivers it to HR dashboard
+  INSERT INTO public.company_notifications (company_id, event, event_type, payload)
+  VALUES (
+    v_company_id,
+    'user_update',
+    'created',
+    jsonb_build_object(
+      'user_id',       NEW.id,
+      'employee_name', v_first_name || ' ' || v_last_name
+    )
+  );
 
   RETURN NEW;
 END;
@@ -1309,6 +1456,86 @@ ALTER FUNCTION "public"."merge_bike_offers"("p_dealer_id" "uuid", "p_models" "js
 
 COMMENT ON FUNCTION "public"."merge_bike_offers"("p_dealer_id" "uuid", "p_models" "jsonb") IS 'Single writer: upserts bike_models (parent, by dealer_id+external_parent_sku) and bikes (offer, by dealer_id+sku) in one pass. Duplicated model columns are copied onto each offer here. in_catalog preserved (audit-owned).';
 
+
+
+CREATE OR REPLACE FUNCTION "public"."promote_sso_claim"("p_claim_id" "uuid", "p_invite_id" "uuid") RETURNS "jsonb"
+    LANGUAGE "plpgsql" SECURITY DEFINER
+    SET "search_path" TO 'public'
+    AS $$
+DECLARE
+  v_claim  sso_pending_claims%ROWTYPE;
+  v_invite profile_invites%ROWTYPE;
+BEGIN
+  -- Caller must be HR/admin in the claim's company, OR the service_role.
+  IF COALESCE(auth.jwt() ->> 'role', '') <> 'service_role'
+     AND public.get_my_role() NOT IN ('hr','admin') THEN
+    RAISE EXCEPTION 'FORBIDDEN';
+  END IF;
+
+  SELECT * INTO v_claim FROM sso_pending_claims WHERE id = p_claim_id FOR UPDATE;
+  IF NOT FOUND THEN RAISE EXCEPTION 'CLAIM_NOT_FOUND'; END IF;
+  IF v_claim.status NOT IN ('awaiting_user_info','pending_review') THEN
+    RAISE EXCEPTION 'CLAIM_ALREADY_RESOLVED status=%', v_claim.status;
+  END IF;
+
+  SELECT * INTO v_invite FROM profile_invites WHERE id = p_invite_id FOR UPDATE;
+  IF NOT FOUND THEN RAISE EXCEPTION 'INVITE_NOT_FOUND'; END IF;
+  IF v_invite.company_id <> v_claim.company_id THEN
+    RAISE EXCEPTION 'INVITE_COMPANY_MISMATCH';
+  END IF;
+  IF v_invite.email IS NOT NULL AND lower(v_invite.email) <> lower(v_claim.email) THEN
+    RAISE EXCEPTION 'INVITE_ALREADY_CLAIMED';
+  END IF;
+
+  -- Bind invite to the SSO user's email so its email is no longer NULL.
+  UPDATE profile_invites
+     SET email  = v_claim.email,
+         status = 'active'::user_profile_status
+   WHERE id = p_invite_id;
+
+  -- Promote profile to active, fill identity fields from the invite, and set
+  -- the canonical back-link (depends on profiles.profile_invite_id).
+  UPDATE profiles SET
+    status            = 'active'::user_profile_status,
+    first_name        = v_invite.first_name,
+    last_name         = v_invite.last_name,
+    description       = v_invite.description,
+    department        = v_invite.department,
+    hire_date         = v_invite.hire_date,
+    profile_invite_id = p_invite_id
+   WHERE user_id = v_claim.user_id;
+
+  -- Assign role + create benefit (idempotent — replays don't error).
+  INSERT INTO user_roles (user_id, role)
+  VALUES (v_claim.user_id, 'employee'::user_role)
+  ON CONFLICT (user_id, role) DO NOTHING;
+
+  INSERT INTO bike_benefits (user_id)
+  VALUES (v_claim.user_id)
+  ON CONFLICT DO NOTHING;
+
+  -- Link any pending REGES employee_pii row to this user (mirrors REGES bridge).
+  UPDATE employee_pii
+     SET user_id = v_claim.user_id, updated_at = now()
+   WHERE profile_invite_id = p_invite_id AND user_id IS NULL;
+
+  -- Resolve claim.
+  UPDATE sso_pending_claims SET
+    status = 'approved', approved_invite_id = p_invite_id,
+    reviewed_by = auth.uid(), reviewed_at = now(), updated_at = now()
+   WHERE id = p_claim_id;
+
+  -- FCM dispatch happens out-of-band via the company_notifications fan-out.
+  INSERT INTO company_notifications (company_id, event, event_type, payload)
+  VALUES (v_claim.company_id, 'user_update', 'sso_claim_approved',
+          jsonb_build_object('user_id', v_claim.user_id, 'invite_id', p_invite_id));
+
+  RETURN jsonb_build_object('approved', true, 'user_id', v_claim.user_id);
+END;
+$$;
+
+
+ALTER FUNCTION "public"."promote_sso_claim"("p_claim_id" "uuid", "p_invite_id" "uuid") OWNER TO "postgres";
 
 
 CREATE OR REPLACE FUNCTION "public"."seed_audit_units"("p_run_id" "uuid") RETURNS "void"
@@ -1834,7 +2061,11 @@ CREATE TABLE IF NOT EXISTS "public"."companies" (
     "days_in_office" integer DEFAULT 5,
     "email_domain" "text" NOT NULL,
     "email_pattern" "public"."email_pattern_kind",
-    CONSTRAINT "companies_email_domain_format" CHECK ((("email_domain" = "lower"("email_domain")) AND ("email_domain" ~ '^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$'::"text")))
+    "sso_kind" "text" DEFAULT 'none'::"text" NOT NULL,
+    "sso_hd_required" boolean DEFAULT true NOT NULL,
+    "sso_config" "jsonb" DEFAULT '{}'::"jsonb" NOT NULL,
+    CONSTRAINT "companies_email_domain_format" CHECK ((("email_domain" = "lower"("email_domain")) AND ("email_domain" ~ '^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$'::"text"))),
+    CONSTRAINT "companies_sso_kind_check" CHECK (("sso_kind" = ANY (ARRAY['none'::"text", 'google_oidc'::"text", 'microsoft_oidc'::"text", 'saml'::"text"])))
 );
 
 
@@ -1870,6 +2101,18 @@ COMMENT ON COLUMN "public"."companies"."email_domain" IS 'Primary corporate emai
 
 
 COMMENT ON COLUMN "public"."companies"."email_pattern" IS 'Optional named email pattern used to derive employee email at REGES ingest. NULL = no derivation (employees self-claim by name/DOB). Template lookup lives in TS (EMAIL_PATTERN_TEMPLATES).';
+
+
+
+COMMENT ON COLUMN "public"."companies"."sso_kind" IS 'SSO method for this tenant. "none" = email+password only. "google_oidc" = Google Workspace via OAuth (implemented). "microsoft_oidc"/"saml" reserved (ADR §5) — config + trigger branch, no re-model.';
+
+
+
+COMMENT ON COLUMN "public"."companies"."sso_hd_required" IS 'When true, the Google ID token "hd" claim must be present and equal email_domain. Set false ONLY for testing / Workspace-less Google accounts. (Microsoft will use sso_config.tenant_id instead.)';
+
+
+
+COMMENT ON COLUMN "public"."companies"."sso_config" IS 'Provider-specific config. Microsoft-ready keys: { tenant_id?, issuer?, email_claim?, attribute_map?, client_id_override? }. Company resolution = tenant assertion first (tid/issuer), email_domain second. Empty {} = defaults.';
 
 
 
@@ -2279,6 +2522,36 @@ ALTER TABLE "public"."role_permissions" ALTER COLUMN "id" ADD GENERATED BY DEFAU
 
 
 
+CREATE TABLE IF NOT EXISTS "public"."sso_pending_claims" (
+    "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,
+    "user_id" "uuid" NOT NULL,
+    "company_id" "uuid" NOT NULL,
+    "email" "text" NOT NULL,
+    "hd" "text",
+    "first_name" "text",
+    "last_name" "text",
+    "date_of_birth_encrypted" "text",
+    "birth_date_hash" "text",
+    "suggested_invite_ids" "uuid"[] DEFAULT '{}'::"uuid"[] NOT NULL,
+    "suggested_scores" "jsonb" DEFAULT '[]'::"jsonb" NOT NULL,
+    "status" "text" DEFAULT 'awaiting_user_info'::"text" NOT NULL,
+    "reviewed_by" "uuid",
+    "reviewed_at" timestamp with time zone,
+    "approved_invite_id" "uuid",
+    "rejected_reason" "text",
+    "created_at" timestamp with time zone DEFAULT "now"() NOT NULL,
+    "updated_at" timestamp with time zone DEFAULT "now"() NOT NULL,
+    CONSTRAINT "sso_pending_claims_status_check" CHECK (("status" = ANY (ARRAY['awaiting_user_info'::"text", 'pending_review'::"text", 'approved'::"text", 'rejected'::"text", 'expired'::"text"])))
+);
+
+
+ALTER TABLE "public"."sso_pending_claims" OWNER TO "postgres";
+
+
+COMMENT ON TABLE "public"."sso_pending_claims" IS 'Review queue for SSO users with no matching profile_invites row. One active row per user (partial unique). Resolved by promote_sso_claim (Migration 4).';
+
+
+
 CREATE TABLE IF NOT EXISTS "public"."sync_run_cache" (
     "run_id" "uuid" NOT NULL,
     "scope" "text" NOT NULL,
@@ -2480,6 +2753,11 @@ ALTER TABLE ONLY "public"."role_permissions"
 
 
 
+ALTER TABLE ONLY "public"."sso_pending_claims"
+    ADD CONSTRAINT "sso_pending_claims_pkey" PRIMARY KEY ("id");
+
+
+
 ALTER TABLE ONLY "public"."sync_run_cache"
     ADD CONSTRAINT "sync_run_cache_pkey" PRIMARY KEY ("run_id", "scope");
 
@@ -2579,6 +2857,10 @@ CREATE INDEX "idx_bikes_type" ON "public"."bikes" USING "btree" ("type");
 
 
 
+CREATE INDEX "idx_companies_email_domain_sso" ON "public"."companies" USING "btree" ("lower"("email_domain"), "sso_kind") WHERE (("email_domain" IS NOT NULL) AND ("sso_kind" <> 'none'::"text"));
+
+
+
 CREATE INDEX "idx_company_notifications_company_id" ON "public"."company_notifications" USING "btree" ("company_id");
 
 
@@ -2671,6 +2953,10 @@ CREATE INDEX "idx_profiles_last_name" ON "public"."profiles" USING "btree" ("las
 
 
 
+CREATE INDEX "idx_sso_pending_claims_company_status" ON "public"."sso_pending_claims" USING "btree" ("company_id", "status") WHERE ("status" = ANY (ARRAY['awaiting_user_info'::"text", 'pending_review'::"text"]));
+
+
+
 CREATE INDEX "idx_sync_runs_dealer_status" ON "public"."sync_runs" USING "btree" ("dealer_id", "status", "started_at" DESC);
 
 
@@ -2704,6 +2990,10 @@ CREATE UNIQUE INDEX "profile_invites_source_unique" ON "public"."profile_invites
 
 
 CREATE UNIQUE INDEX "profiles_profile_invite_unique" ON "public"."profiles" USING "btree" ("profile_invite_id") WHERE ("profile_invite_id" IS NOT NULL);
+
+
+
+CREATE UNIQUE INDEX "sso_pending_claims_user_active" ON "public"."sso_pending_claims" USING "btree" ("user_id") WHERE ("status" = ANY (ARRAY['awaiting_user_info'::"text", 'pending_review'::"text"]));
 
 
 
@@ -2907,6 +3197,26 @@ ALTER TABLE ONLY "public"."profiles"
 
 
 
+ALTER TABLE ONLY "public"."sso_pending_claims"
+    ADD CONSTRAINT "sso_pending_claims_approved_invite_id_fkey" FOREIGN KEY ("approved_invite_id") REFERENCES "public"."profile_invites"("id");
+
+
+
+ALTER TABLE ONLY "public"."sso_pending_claims"
+    ADD CONSTRAINT "sso_pending_claims_company_id_fkey" FOREIGN KEY ("company_id") REFERENCES "public"."companies"("id") ON DELETE CASCADE;
+
+
+
+ALTER TABLE ONLY "public"."sso_pending_claims"
+    ADD CONSTRAINT "sso_pending_claims_reviewed_by_fkey" FOREIGN KEY ("reviewed_by") REFERENCES "public"."profiles"("user_id");
+
+
+
+ALTER TABLE ONLY "public"."sso_pending_claims"
+    ADD CONSTRAINT "sso_pending_claims_user_id_fkey" FOREIGN KEY ("user_id") REFERENCES "auth"."users"("id") ON DELETE CASCADE;
+
+
+
 ALTER TABLE ONLY "public"."sync_run_cache"
     ADD CONSTRAINT "sync_run_cache_run_id_fkey" FOREIGN KEY ("run_id") REFERENCES "public"."sync_runs"("id") ON DELETE CASCADE;
 
@@ -3100,6 +3410,10 @@ CREATE POLICY "employee_pii_self_select" ON "public"."employee_pii" FOR SELECT T
 
 
 
+CREATE POLICY "hr manages sso_pending_claims in own company" ON "public"."sso_pending_claims" TO "authenticated" USING ((("public"."get_my_role"() = ANY (ARRAY['hr'::"text", 'admin'::"text"])) AND ("company_id" = "public"."auth_company_id"()))) WITH CHECK ((("public"."get_my_role"() = ANY (ARRAY['hr'::"text", 'admin'::"text"])) AND ("company_id" = "public"."auth_company_id"())));
+
+
+
 CREATE POLICY "hr_admin_select_own_company_notifications" ON "public"."company_notifications" FOR SELECT TO "authenticated" USING ((("company_id" = "public"."auth_company_id"()) AND (("auth"."jwt"() ->> 'user_role'::"text") = ANY (ARRAY['hr'::"text", 'admin'::"text"]))));
 
 
@@ -3154,6 +3468,9 @@ CREATE POLICY "profiles_self_update" ON "public"."profiles" FOR UPDATE TO "authe
 ALTER TABLE "public"."role_permissions" ENABLE ROW LEVEL SECURITY;
 
 
+ALTER TABLE "public"."sso_pending_claims" ENABLE ROW LEVEL SECURITY;
+
+
 ALTER TABLE "public"."sync_run_cache" ENABLE ROW LEVEL SECURITY;
 
 
@@ -3183,6 +3500,10 @@ CREATE POLICY "tbi_loan_hr_select" ON "public"."tbi_loan_applications" FOR SELEC
   WHERE (("ur"."user_id" = "auth"."uid"()) AND ("ur"."role" = ANY (ARRAY['hr'::"public"."user_role", 'admin'::"public"."user_role"]))))) AND (EXISTS ( SELECT 1
    FROM "public"."profiles" "p"
   WHERE (("p"."user_id" = "tbi_loan_applications"."profile_id") AND ("p"."company_id" = "public"."auth_company_id"()))))));
+
+
+
+CREATE POLICY "user reads own sso_pending_claim" ON "public"."sso_pending_claims" FOR SELECT TO "authenticated" USING (("user_id" = "auth"."uid"()));
 
 
 
@@ -3635,6 +3956,12 @@ GRANT ALL ON FUNCTION "public"."merge_bike_offers"("p_dealer_id" "uuid", "p_mode
 
 
 
+GRANT ALL ON FUNCTION "public"."promote_sso_claim"("p_claim_id" "uuid", "p_invite_id" "uuid") TO "anon";
+GRANT ALL ON FUNCTION "public"."promote_sso_claim"("p_claim_id" "uuid", "p_invite_id" "uuid") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."promote_sso_claim"("p_claim_id" "uuid", "p_invite_id" "uuid") TO "service_role";
+
+
+
 GRANT ALL ON FUNCTION "public"."seed_audit_units"("p_run_id" "uuid") TO "anon";
 GRANT ALL ON FUNCTION "public"."seed_audit_units"("p_run_id" "uuid") TO "authenticated";
 GRANT ALL ON FUNCTION "public"."seed_audit_units"("p_run_id" "uuid") TO "service_role";
@@ -3915,6 +4242,12 @@ GRANT ALL ON TABLE "public"."role_permissions" TO "service_role";
 GRANT ALL ON SEQUENCE "public"."role_permissions_id_seq" TO "anon";
 GRANT ALL ON SEQUENCE "public"."role_permissions_id_seq" TO "authenticated";
 GRANT ALL ON SEQUENCE "public"."role_permissions_id_seq" TO "service_role";
+
+
+
+GRANT ALL ON TABLE "public"."sso_pending_claims" TO "anon";
+GRANT ALL ON TABLE "public"."sso_pending_claims" TO "authenticated";
+GRANT ALL ON TABLE "public"."sso_pending_claims" TO "service_role";
 
 
 

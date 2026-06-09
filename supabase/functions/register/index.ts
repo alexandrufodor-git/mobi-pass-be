@@ -33,13 +33,7 @@ import { corsResponse } from "../_shared/ioHelpers.ts"
 import { makeRestClient, type RestClient } from "../_shared/supabaseRest.ts"
 import { birthDateHash } from "../_shared/piiLookup.ts"
 import { normalizeName } from "../_shared/regesMapping.ts"
-
-// Weight coefficients sum to 1.0 in the best case. Clamped to [0, 1].
-const W_EMAIL_DERIVED = 0.45
-const W_DOB           = 0.30
-const W_FIRST         = 0.15
-const W_LAST          = 0.10
-const CLAIM_THRESHOLD = 0.50
+import { score, CLAIM_THRESHOLD, type MatchCandidate } from "../_shared/regesScoring.ts"
 
 interface RegisterBody {
   email?:         string
@@ -49,24 +43,8 @@ interface RegisterBody {
   date_of_birth?: string  // ISO YYYY-MM-DD
 }
 
-interface MatchCandidate {
-  id:                  string
-  radiat:              boolean
-  email_derived_match: boolean
-  dob_matched:         boolean
-  first_score:         number
-  last_score:          number
-  total:               number
-}
-
-function score(c: Omit<MatchCandidate, "total">): number {
-  let s = 0
-  if (c.email_derived_match) s += W_EMAIL_DERIVED
-  if (c.dob_matched)         s += W_DOB
-  s += Math.max(0, Math.min(1, c.first_score)) * W_FIRST
-  s += Math.max(0, Math.min(1, c.last_score))  * W_LAST
-  return Math.min(1, s)
-}
+// A match_pending_invite candidate plus its computed weighted score.
+type ScoredCandidate = MatchCandidate & { total: number }
 
 async function sendOtp(supabaseUrl: string, serviceKey: string, email: string): Promise<Response> {
   return await fetch(`${supabaseUrl}/auth/v1/otp`, {
@@ -218,7 +196,7 @@ Deno.serve(async (req) => {
 
   const dobHash = await birthDateHash(db, dob)
 
-  const raw = await db.rpc<Array<Omit<MatchCandidate, "total">>>("match_pending_invite", {
+  const raw = await db.rpc<MatchCandidate[]>("match_pending_invite", {
     p_company_id:  company.id,
     p_dob_hash:    dobHash,
     p_first_norm:  firstNorm,
@@ -226,7 +204,7 @@ Deno.serve(async (req) => {
     p_email_lower: emailLower,
   })
 
-  const scored: MatchCandidate[] = raw.map((c) => ({ ...c, total: score(c) }))
+  const scored: ScoredCandidate[] = raw.map((c) => ({ ...c, total: score(c) }))
   const above = scored.filter((c) => c.total >= CLAIM_THRESHOLD)
 
   const auditCandidates = scored.map((c) => ({

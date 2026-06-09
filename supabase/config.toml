@@ -414,6 +414,12 @@ verify_jwt = true
 import_map = "./functions/get-employee-details/deno.json"
 entrypoint = "./functions/get-employee-details/index.ts"
 
+[functions.sso-claim-record]
+enabled = true
+verify_jwt = true
+import_map = "./functions/sso-claim-record/deno.json"
+entrypoint = "./functions/sso-claim-record/index.ts"
+
 [functions.tbi-loan-request]
 enabled = true
 verify_jwt = true

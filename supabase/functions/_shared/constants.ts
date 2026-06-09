@@ -58,6 +58,10 @@ export const NotificationEvent = {
   CONTRACT_SIGNED_HR: "contract_signed_hr",
   CONTRACT_APPROVED:  "contract_approved",
   LOAN_STATUS_UPDATE: "loan_status_update",
+  // SSO claim review (HR realtime + user FCM when approved/rejected offline)
+  SSO_CLAIM_PENDING:  "sso_claim_pending",
+  SSO_CLAIM_APPROVED: "sso_claim_approved",
+  SSO_CLAIM_REJECTED: "sso_claim_rejected",
 } as const
 
 export type NotificationEventType = typeof NotificationEvent[keyof typeof NotificationEvent]
@@ -112,6 +116,9 @@ export const Errors = {
   INVITE_INACTIVE: { error: "invite_inactive" },
   COMPANY_NOT_FOUND_FOR_DOMAIN: { error: "company_not_found_for_domain" },
   CHECK_DETAILS: { error: "check_details" },
+  // SSO claim (sso-claim-record)
+  NAME_REQUIRED_FOR_CLAIM: { error: "name_required_for_claim" },
+  NO_PENDING_CLAIM: { error: "no_pending_claim" },
 } as const
 
 // Server-side log helper. Logs only the short error code (no PII, no request body,

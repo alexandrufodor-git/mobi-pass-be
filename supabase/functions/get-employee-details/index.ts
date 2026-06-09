@@ -11,6 +11,7 @@ import { decrypt } from "../_shared/piiCrypto.ts"
 interface Profile {
   user_id: string
   email: string
+  status: string
   company_id: string
   first_name: string
   last_name: string
@@ -137,7 +138,7 @@ Deno.serve(async (req) => {
     const profile = await db.getOne<Profile>(
       "profiles",
       `user_id=eq.${encodeURIComponent(targetUserId)}`,
-      "user_id,email,company_id,first_name,last_name,description,department,hire_date,profile_image_path"
+      "user_id,email,status,company_id,first_name,last_name,description,department,hire_date,profile_image_path"
     )
     if (!profile) throw badRequest(Errors.PROFILE_NOT_FOUND, undefined, origin)
 
@@ -150,6 +151,21 @@ Deno.serve(async (req) => {
       )
       if (!callerProfile || callerProfile.company_id !== profile.company_id) {
         throw forbidden(undefined, origin)
+      }
+    }
+
+    // ── SSO pending claim ───────────────────────────────────────────────────
+    // Present only when the user signed in via Google but matched no invite.
+    // Lets the app route to the ClaimRecord screen without a second round-trip.
+    let ssoClaim: { id: string; status: string; submitted: boolean } | null = null
+    if (profile.status === "pending_sso_claim") {
+      const claim = await db.getOne<{ id: string; status: string }>(
+        "sso_pending_claims",
+        `user_id=eq.${encodeURIComponent(targetUserId)}&status=in.(awaiting_user_info,pending_review)`,
+        "id,status"
+      )
+      if (claim) {
+        ssoClaim = { id: claim.id, status: claim.status, submitted: claim.status === "pending_review" }
       }
     }
 
@@ -240,6 +256,8 @@ Deno.serve(async (req) => {
     const response = {
       invite_id:                invite?.id ?? null,
       email:                    profile.email,
+      profile_status:           profile.status,
+      sso_claim:                ssoClaim,
       invite_status:            invite?.status ?? null,
       company_id:               profile.company_id,
       company_name:             company?.name ?? null,
