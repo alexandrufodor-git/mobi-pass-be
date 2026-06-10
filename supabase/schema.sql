@@ -155,7 +155,9 @@ CREATE TYPE "public"."email_pattern_kind" AS ENUM (
     'first_middle_last',
     'first_last',
     'last_first',
-    'first_initial_last'
+    'first_initial_last',
+    'last',
+    'first'
 );
 
 

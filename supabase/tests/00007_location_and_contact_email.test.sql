@@ -29,7 +29,7 @@ DECLARE
   v_bike   uuid;
 BEGIN
   INSERT INTO public.companies (name, monthly_benefit_subsidy, contract_months, currency, email_domain)
-  VALUES ('loc-co-' || gen_random_uuid()::text, 72.00, 36, 'RON', 'loc-' || gen_random_uuid()::text || '.test') RETURNING id INTO v_co;
+  VALUES ('loc-co-' || gen_random_uuid()::text, 72.00, 36, 'RON', 'test.local') RETURNING id INTO v_co;
 
   INSERT INTO auth.users (id, instance_id, aud, role, email, encrypted_password, created_at, updated_at, confirmation_token, email_change, email_change_token_new, recovery_token)
   VALUES

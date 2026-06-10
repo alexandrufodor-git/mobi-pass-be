@@ -358,6 +358,19 @@ async function registerFromStaged(companyId: string): Promise<string> {
   return user.id
 }
 
+/**
+ * Grant the `hr` role on top of the `employee` role the registration trigger
+ * already created — the test account exercises the multi-role "HR is also an
+ * employee" use case, so it must hold both. The custom_access_token_hook then
+ * emits user_role="hr" (highest privilege) and user_roles=["hr","employee"].
+ * Safe as a plain insert: deleteAccount wipes user_roles each reset and
+ * registration only re-adds the employee row, so hr is always absent here.
+ */
+async function grantHrRole(userId: string): Promise<void> {
+  await rest("POST", `/rest/v1/user_roles`,
+    { user_id: userId, role: "hr" }, "return=minimal")
+}
+
 // ─── Target state appliers ──────────────────────────────────────────────────
 // These change ONLY the dynamic state. The REGES identity PII linked at
 // registration is preserved (never deleted) — same employee data every reset.
@@ -496,6 +509,8 @@ async function applyTarget(target: FlowTarget, companyId: string): Promise<void>
   if (target === "reges_pending") return
 
   const uid = await registerFromStaged(companyId)
+  // Every registered E2E state holds hr+employee (multi-role use case).
+  await grantHrRole(uid)
   switch (target) {
     case "fresh":                    await resetToFresh(uid); break
     case "pickup_ready_no_address":  await resetToPickupReadyNoAddress(uid, companyId); break

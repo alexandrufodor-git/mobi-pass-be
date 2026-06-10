@@ -65,6 +65,7 @@
 #   CURRENCY                — RON (one of: RON, EUR — extend if needed)
 #   EMAIL_PATTERN           — null. Enum: last_middle_first | first_middle_last
 #                             | first_last | last_first | first_initial_last
+#                             | last | first
 #   CONTACT_EMAIL           — contact@$EMAIL_DOMAIN
 #   ESIGNATURES_TEMPLATE_ID — null (set per project if you have a template)
 #   ADDRESS                 — null
@@ -165,12 +166,27 @@ if ! [[ "$EMAIL_DOMAIN" =~ ^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[
   exit 1
 fi
 
+# The HR login account MUST live on the company domain. A mismatch here (almost
+# always a typo) produces an account that can never log in, so fail loud and
+# early — before touching the DB. The DB also enforces this via the
+# enforce_email_matches_company_domain trigger on profile_invites/profiles, but
+# catching it here gives a precise, pre-flight error. (lowercase for the
+# case-insensitive domain compare; bash 3.2-safe via tr.)
+HR_EMAIL_DOMAIN="$(printf '%s' "${HR_EMAIL##*@}" | tr '[:upper:]' '[:lower:]')"
+if [[ "$HR_EMAIL_DOMAIN" != "$EMAIL_DOMAIN" ]]; then
+  echo "✗ HR_EMAIL '$HR_EMAIL' is not on the company domain." >&2
+  echo "  HR email domain: '$HR_EMAIL_DOMAIN'" >&2
+  echo "  Company domain:  '$EMAIL_DOMAIN'" >&2
+  echo "  The HR account email must end with '@$EMAIL_DOMAIN'." >&2
+  exit 1
+fi
+
 if [[ -n "$EMAIL_PATTERN" ]]; then
   case "$EMAIL_PATTERN" in
-    last_middle_first|first_middle_last|first_last|last_first|first_initial_last) ;;
+    last_middle_first|first_middle_last|first_last|last_first|first_initial_last|last|first) ;;
     *)
       echo "✗ EMAIL_PATTERN '$EMAIL_PATTERN' is not a valid enum value." >&2
-      echo "  Allowed: last_middle_first, first_middle_last, first_last, last_first, first_initial_last" >&2
+      echo "  Allowed: last_middle_first, first_middle_last, first_last, last_first, first_initial_last, last, first" >&2
       exit 1
       ;;
   esac

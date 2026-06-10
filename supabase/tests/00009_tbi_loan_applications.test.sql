@@ -32,23 +32,23 @@ DECLARE
 BEGIN
   -- Two companies
   INSERT INTO public.companies (name, monthly_benefit_subsidy, contract_months, currency, email_domain)
-  VALUES ('tbi-co1-' || gen_random_uuid()::text, 72.00, 36, 'RON', 'tbi1-' || gen_random_uuid()::text || '.test') RETURNING id INTO v_co1;
+  VALUES ('tbi-co1-' || gen_random_uuid()::text, 72.00, 36, 'RON', 'test.local') RETURNING id INTO v_co1;
 
   INSERT INTO public.companies (name, monthly_benefit_subsidy, contract_months, currency, email_domain)
-  VALUES ('tbi-co2-' || gen_random_uuid()::text, 100.00, 24, 'EUR', 'tbi2-' || gen_random_uuid()::text || '.test') RETURNING id INTO v_co2;
+  VALUES ('tbi-co2-' || gen_random_uuid()::text, 100.00, 24, 'EUR', 'tbi2.test') RETURNING id INTO v_co2;
 
   -- Auth users
   INSERT INTO auth.users (id, instance_id, aud, role, email, encrypted_password, created_at, updated_at, confirmation_token, email_change, email_change_token_new, recovery_token)
   VALUES
     (v_emp1, '00000000-0000-0000-0000-000000000000'::uuid, 'authenticated', 'authenticated', 'emp1-tbi@test.local', '', now(), now(), '', '', '', ''),
-    (v_emp2, '00000000-0000-0000-0000-000000000000'::uuid, 'authenticated', 'authenticated', 'emp2-tbi@test.local', '', now(), now(), '', '', '', ''),
+    (v_emp2, '00000000-0000-0000-0000-000000000000'::uuid, 'authenticated', 'authenticated', 'emp2-tbi@tbi2.test', '', now(), now(), '', '', '', ''),
     (v_hr,   '00000000-0000-0000-0000-000000000000'::uuid, 'authenticated', 'authenticated', 'hr-tbi@test.local',   '', now(), now(), '', '', '', '');
 
   -- Profiles: emp1 + hr in co1, emp2 in co2
   INSERT INTO public.profiles (user_id, email, company_id, status, first_name, last_name)
   VALUES
     (v_emp1, 'emp1-tbi@test.local', v_co1, 'active', 'Alice', 'Employee'),
-    (v_emp2, 'emp2-tbi@test.local', v_co2, 'active', 'Bob',   'Other'),
+    (v_emp2, 'emp2-tbi@tbi2.test', v_co2, 'active', 'Bob',   'Other'),
     (v_hr,   'hr-tbi@test.local',   v_co1, 'active', 'Carol', 'HR');
 
   INSERT INTO public.user_roles (user_id, role) VALUES

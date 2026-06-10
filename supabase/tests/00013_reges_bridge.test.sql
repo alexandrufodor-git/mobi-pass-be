@@ -66,7 +66,7 @@ BEGIN
     email_domain, email_pattern
   ) VALUES (
     'reges-co-a-' || gen_random_uuid()::text, 80.00, 36, 'RON',
-    'reges-a-' || (extract(epoch from clock_timestamp())::bigint) || '.com',
+    'test.local',
     'first_last'::public.email_pattern_kind
   ) RETURNING id INTO v_co_a;
 
@@ -163,13 +163,13 @@ BEGIN
 
   -- One claimed row with email
   INSERT INTO public.profile_invites (company_id, email, first_name, last_name)
-  VALUES (v_co_a, 't05-claim@example.com', 'T05c', 'Claim');
+  VALUES (v_co_a, 't05-claim@test.local', 'T05c', 'Claim');
 END;
 $$;
 
 SELECT throws_ok(
   $$INSERT INTO public.profile_invites (company_id, email, first_name, last_name)
-    VALUES ((SELECT current_setting('test.co_a_id'))::uuid, 'T05-CLAIM@example.com', 'Dup', 'Dup')$$,
+    VALUES ((SELECT current_setting('test.co_a_id'))::uuid, 'T05-CLAIM@test.local', 'Dup', 'Dup')$$,
   '23505',
   NULL,
   'T05: profile_invites_email_unique blocks duplicate non-NULL email (case-insensitive)'
@@ -424,7 +424,7 @@ BEGIN
     company_id, email, first_name, last_name, source, source_ref_id,
     birth_date_hash
   ) VALUES (
-    v_co_a, 't-mp-claimed@example.com', 'claimed', 'ghita', 'reges', 't-mp-claimed',
+    v_co_a, 't-mp-claimed@test.local', 'claimed', 'ghita', 'reges', 't-mp-claimed',
     'hash-dob-claimed'
   );
 
@@ -660,7 +660,7 @@ DECLARE
 BEGIN
   -- Manually claim t25-a so the next ingest finds email IS NOT NULL.
   UPDATE public.profile_invites
-     SET email = 't27-claim@example.com'
+     SET email = 't27-claim@test.local'
    WHERE company_id = v_co_a
      AND source = 'reges'
      AND source_ref_id = 't25-a';
@@ -760,7 +760,7 @@ DO $$
 DECLARE
   v_co_a uuid := current_setting('test.co_a_id')::uuid;
   v_user uuid := gen_random_uuid();
-  v_email text := 'meler.angura.' || substr(gen_random_uuid()::text, 1, 8) || '@t30.local';
+  v_email text := 'meler.angura.' || substr(gen_random_uuid()::text, 1, 8) || '@test.local';
   v_result jsonb;
   v_pii_user uuid;
   v_invite_user uuid;
@@ -840,7 +840,7 @@ DO $$
 DECLARE
   v_co_a uuid := current_setting('test.co_a_id')::uuid;
   v_user uuid := gen_random_uuid();
-  v_email text := 'merge.user.' || substr(gen_random_uuid()::text, 1, 8) || '@t31.local';
+  v_email text := 'merge.user.' || substr(gen_random_uuid()::text, 1, 8) || '@test.local';
   v_existing_pii uuid;
   v_after_pii uuid;
   v_after_addr text;

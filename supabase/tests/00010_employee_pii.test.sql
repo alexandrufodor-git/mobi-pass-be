@@ -40,23 +40,23 @@ DECLARE
 BEGIN
   -- Two companies (unique names so tests don't clash with seed data)
   INSERT INTO public.companies (name, monthly_benefit_subsidy, contract_months, currency, email_domain)
-  VALUES ('pii-co-a-' || gen_random_uuid()::text, 72.00, 36, 'RON', 'pii-a-' || gen_random_uuid()::text || '.test') RETURNING id INTO v_co_a;
+  VALUES ('pii-co-a-' || gen_random_uuid()::text, 72.00, 36, 'RON', 'test.local') RETURNING id INTO v_co_a;
 
   INSERT INTO public.companies (name, monthly_benefit_subsidy, contract_months, currency, email_domain)
-  VALUES ('pii-co-b-' || gen_random_uuid()::text, 100.00, 12, 'EUR', 'pii-b-' || gen_random_uuid()::text || '.test') RETURNING id INTO v_co_b;
+  VALUES ('pii-co-b-' || gen_random_uuid()::text, 100.00, 12, 'EUR', 'piib.test') RETURNING id INTO v_co_b;
 
   -- Users in auth.users
   INSERT INTO auth.users (id, instance_id, aud, role, email, encrypted_password, created_at, updated_at, confirmation_token, email_change, email_change_token_new, recovery_token)
   VALUES
     (v_emp_a, '00000000-0000-0000-0000-000000000000'::uuid, 'authenticated', 'authenticated', 'emp-a-pii@test.local', '', now(), now(), '', '', '', ''),
-    (v_emp_b, '00000000-0000-0000-0000-000000000000'::uuid, 'authenticated', 'authenticated', 'emp-b-pii@test.local', '', now(), now(), '', '', '', ''),
+    (v_emp_b, '00000000-0000-0000-0000-000000000000'::uuid, 'authenticated', 'authenticated', 'emp-b-pii@piib.test', '', now(), now(), '', '', '', ''),
     (v_hr_a,  '00000000-0000-0000-0000-000000000000'::uuid, 'authenticated', 'authenticated', 'hr-a-pii@test.local',  '', now(), now(), '', '', '', '');
 
   -- Profiles: emp_a in co_a, emp_b in co_b, hr_a in co_a
   INSERT INTO public.profiles (user_id, email, company_id, status, first_name, last_name)
   VALUES
     (v_emp_a, 'emp-a-pii@test.local', v_co_a, 'active', 'Alice', 'A'),
-    (v_emp_b, 'emp-b-pii@test.local', v_co_b, 'active', 'Bob',   'B'),
+    (v_emp_b, 'emp-b-pii@piib.test', v_co_b, 'active', 'Bob',   'B'),
     (v_hr_a,  'hr-a-pii@test.local',  v_co_a, 'active', 'HR',    'Admin');
 
   INSERT INTO public.user_roles (user_id, role) VALUES

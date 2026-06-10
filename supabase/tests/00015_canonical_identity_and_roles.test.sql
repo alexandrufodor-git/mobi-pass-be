@@ -40,7 +40,7 @@ DECLARE
   v_uid_norole uuid := gen_random_uuid();
 BEGIN
   INSERT INTO public.companies (name, monthly_benefit_subsidy, contract_months, currency, email_domain)
-  VALUES ('canon-co-' || gen_random_uuid()::text, 50.00, 24, 'EUR', 'canon-' || gen_random_uuid()::text || '.test')
+  VALUES ('canon-co-' || gen_random_uuid()::text, 50.00, 24, 'EUR', 'test.local')
   RETURNING id INTO v_co;
 
   -- ── Email-matched invite + auth user (trigger fired by the UPDATE below) ──

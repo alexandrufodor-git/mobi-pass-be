@@ -23,22 +23,22 @@ DECLARE
   v_out    uuid := gen_random_uuid();
 BEGIN
   INSERT INTO public.companies (name, monthly_benefit_subsidy, contract_months, currency, email_domain)
-  VALUES ('rls-co-a-' || gen_random_uuid()::text, 100.00, 12, 'EUR', 'rls-a-' || gen_random_uuid()::text || '.test') RETURNING id INTO v_co_a;
+  VALUES ('rls-co-a-' || gen_random_uuid()::text, 100.00, 12, 'EUR', 'test.local') RETURNING id INTO v_co_a;
 
   INSERT INTO public.companies (name, monthly_benefit_subsidy, contract_months, currency, email_domain)
-  VALUES ('rls-co-b-' || gen_random_uuid()::text, 100.00, 12, 'EUR', 'rls-b-' || gen_random_uuid()::text || '.test') RETURNING id INTO v_co_b;
+  VALUES ('rls-co-b-' || gen_random_uuid()::text, 100.00, 12, 'EUR', 'cob.test') RETURNING id INTO v_co_b;
 
   INSERT INTO auth.users (id, instance_id, aud, role, email, encrypted_password, created_at, updated_at, confirmation_token, email_change, email_change_token_new, recovery_token)
   VALUES
     (v_hr,  '00000000-0000-0000-0000-000000000000'::uuid, 'authenticated', 'authenticated', 'hr-pgtap@test.local',       '', now(), now(), '', '', '', ''),
     (v_emp, '00000000-0000-0000-0000-000000000000'::uuid, 'authenticated', 'authenticated', 'emp-pgtap@test.local',      '', now(), now(), '', '', '', ''),
-    (v_out, '00000000-0000-0000-0000-000000000000'::uuid, 'authenticated', 'authenticated', 'outsider-pgtap@test.local', '', now(), now(), '', '', '', '');
+    (v_out, '00000000-0000-0000-0000-000000000000'::uuid, 'authenticated', 'authenticated', 'outsider-pgtap@cob.test', '', now(), now(), '', '', '', '');
 
   INSERT INTO public.profiles (user_id, email, company_id, status, first_name, last_name)
   VALUES
     (v_hr,  'hr-pgtap@test.local',      v_co_a, 'active', 'HR',       'User'),
     (v_emp, 'emp-pgtap@test.local',      v_co_a, 'active', 'Employee', 'User'),
-    (v_out, 'outsider-pgtap@test.local', v_co_b, 'active', 'Outside',  'User');
+    (v_out, 'outsider-pgtap@cob.test', v_co_b, 'active', 'Outside',  'User');
 
   INSERT INTO public.user_roles (user_id, role) VALUES
     (v_hr,  'hr'::public.user_role),

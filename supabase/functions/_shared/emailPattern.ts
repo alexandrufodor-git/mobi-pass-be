@@ -29,6 +29,8 @@ export type EmailPatternKind =
   | "first_last"
   | "last_first"
   | "first_initial_last"
+  | "last"
+  | "first"
 
 export const EMAIL_PATTERN_TEMPLATES: Record<EmailPatternKind, string> = {
   last_middle_first:  "{last}?{.{middle}}.{first}",
@@ -36,6 +38,8 @@ export const EMAIL_PATTERN_TEMPLATES: Record<EmailPatternKind, string> = {
   first_last:         "{first}.{last}",
   last_first:         "{last}.{first}",
   first_initial_last: "{first_initial}{last}",
+  last:               "{last}",
+  first:              "{first}",
 }
 
 export interface PatternInput {

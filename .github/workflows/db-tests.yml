@@ -1,0 +1,42 @@
+name: Database Tests
+
+# Runs the pgTAP suite (supabase/tests/*.test.sql) on every push to main and
+# every PR, so migrations and RLS policies are verified before they merge.
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'supabase/migrations/**'
+      - 'supabase/tests/**'
+      - 'supabase/seed.sql'
+      - 'supabase/config.toml'
+      - '.github/workflows/db-tests.yml'
+  pull_request:
+    paths:
+      - 'supabase/migrations/**'
+      - 'supabase/tests/**'
+      - 'supabase/seed.sql'
+      - 'supabase/config.toml'
+      - '.github/workflows/db-tests.yml'
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out code
+        uses: actions/checkout@v4
+
+      - name: Install Supabase CLI
+        uses: supabase/setup-cli@v1
+        with:
+          version: latest
+
+      # Spins up Postgres only (no API/auth/storage containers), applies every
+      # migration in supabase/migrations and runs supabase/seed.sql. pgTAP tests
+      # operate at the SQL layer, so the database alone is enough and it starts
+      # far faster than the full `supabase start`.
+      - name: Start database (apply migrations + seed)
+        run: supabase db start
+
+      - name: Run pgTAP tests
+        run: supabase test db
