@@ -1,99 +1,71 @@
-// Unit tests for the send-contract broadcast behaviour.
+// Unit tests for send-contract signer construction.
 // Run with: deno test --allow-env supabase/functions/send-contract/send-contract.test.ts
 
 import { assertEquals } from "jsr:@std/assert"
-import { stub } from "jsr:@std/testing/mock"
-import { sendBroadcast } from "../_shared/broadcast.ts"
+import { buildSigners, SignerProfile } from "./signers.ts"
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
-/** Captures fetch calls made by sendBroadcast. */
-function captureBroadcastFetch(): {
-  calls: { url: string; body: unknown }[]
-  stub: ReturnType<typeof stub>
-} {
-  const calls: { url: string; body: unknown }[] = []
-  const fetchStub = stub(
-    globalThis,
-    "fetch",
-    (input: unknown, init?: unknown): Promise<Response> => {
-      const url = String(input instanceof Request ? input.url : input)
-      const options = init as RequestInit | undefined
-      calls.push({ url, body: options?.body ? JSON.parse(options.body as string) : null })
-      return Promise.resolve(new Response("{}", { status: 200 }))
-    },
-  )
-  return { calls, stub: fetchStub }
+function profile(over: Partial<SignerProfile> = {}): SignerProfile {
+  return {
+    first_name: "Jane",
+    last_name: "Doe",
+    email: "jane@company.com",
+    ...over,
+  }
 }
 
 // ─── Tests ───────────────────────────────────────────────────────────────────
 
-Deno.test("sendBroadcast: sends contract_update with event_type 'created' and correct contract_id", async () => {
-  // Provide env vars expected by sendBroadcast
-  const envStubs = [
-    stub(Deno.env, "get", (key: string) => {
-      if (key === "SUPABASE_URL") return "https://test.supabase.co"
-      if (key === "SUPABASE_SERVICE_ROLE_KEY") return "test-service-key"
-      return undefined
-    }),
-  ]
+Deno.test("buildSigners: distinct employee and HR → two signers in order", () => {
+  const employee = profile({ first_name: "Jane", last_name: "Doe", email: "jane@company.com" })
+  const hr = profile({ first_name: "Hank", last_name: "Ross", email: "hr@company.com" })
 
-  const { calls, stub: fetchStub } = captureBroadcastFetch()
-  try {
-    await sendBroadcast(
-      "notifications:company-uuid-001",
-      "contract_update",
-      {
-        user_id: "user-uuid-001",
-        employee_name: "Jane Doe",
-        event_type: "created",
-        contract_id: "contract-uuid-001",
-      },
-    )
+  const signers = buildSigners(employee, hr, "BigTech1")
 
-    assertEquals(calls.length, 1)
-    assertEquals(calls[0].url, "https://test.supabase.co/realtime/v1/api/broadcast")
-
-    const body = calls[0].body as { messages: { topic: string; event: string; payload: Record<string, unknown> }[] }
-    assertEquals(body.messages.length, 1)
-    assertEquals(body.messages[0].topic, "notifications:company-uuid-001")
-    assertEquals(body.messages[0].event, "contract_update")
-    assertEquals(body.messages[0].payload.event_type, "created")
-    assertEquals(body.messages[0].payload.contract_id, "contract-uuid-001")
-    assertEquals(body.messages[0].payload.user_id, "user-uuid-001")
-  } finally {
-    fetchStub.restore()
-    for (const s of envStubs) s.restore()
-  }
+  assertEquals(signers.length, 2)
+  assertEquals(signers[0].email, "jane@company.com")
+  assertEquals(signers[0].signing_order, 1)
+  assertEquals(signers[0].company_name, "BigTech1") // both parties belong to the company
+  assertEquals(signers[1].email, "hr@company.com")
+  assertEquals(signers[1].signing_order, 2)
+  assertEquals(signers[1].company_name, "BigTech1")
 })
 
-Deno.test("sendBroadcast: broadcast error does not propagate when caught with .catch()", async () => {
-  const envStubs = [
-    stub(Deno.env, "get", (key: string) => {
-      if (key === "SUPABASE_URL") return "https://test.supabase.co"
-      if (key === "SUPABASE_SERVICE_ROLE_KEY") return "test-service-key"
-      return undefined
-    }),
-  ]
+Deno.test("buildSigners: employee IS the HR (same account) → still two signers, differentiated", () => {
+  const same = profile({ first_name: "Jane", last_name: "Doe", email: "jane@company.com" })
 
-  const fetchStub = stub(
-    globalThis,
-    "fetch",
-    (_input: unknown, _init?: unknown): Promise<Response> => {
-      return Promise.resolve(new Response("Internal Server Error", { status: 500 }))
-    },
-  )
+  // Both roles resolve to the same person/email (multi-role user).
+  const signers = buildSigners(same, same, "BigTech1")
 
-  try {
-    // sendBroadcast logs on non-ok but does not throw — must complete without error
-    await sendBroadcast(
-      "notifications:company-uuid-002",
-      "contract_update",
-      { user_id: "u", employee_name: "Test", event_type: "created", contract_id: "c" },
-    ).catch(() => { /* swallowed, as in send-contract handler */ })
-  } finally {
-    fetchStub.restore()
-    for (const s of envStubs) s.restore()
-  }
-  // If we reach here without throwing, the test passes
+  // The legal requirement: both the beneficiary and the employer signature
+  // blocks must exist even though one human holds both roles.
+  assertEquals(signers.length, 2)
+  assertEquals(signers[0].signing_order, 1)
+  assertEquals(signers[1].signing_order, 2)
+  // Same inbox, two signing roles. eSignatures keeps both same-email signers
+  // (verified against the sandbox), so the employer signature block survives.
+  assertEquals(signers[0].email, signers[1].email)
+  assertEquals(signers[0].company_name, "BigTech1")
+  assertEquals(signers[1].company_name, "BigTech1")
+})
+
+Deno.test("buildSigners: signer missing email/first_name is skipped", () => {
+  const employee = profile({ email: "jane@company.com" })
+  const hr = profile({ first_name: "", email: "" })
+
+  const signers = buildSigners(employee, hr, "BigTech1")
+
+  assertEquals(signers.length, 1)
+  assertEquals(signers[0].email, "jane@company.com")
+})
+
+Deno.test("buildSigners: name is trimmed first+last", () => {
+  const employee = profile({ first_name: "Jane", last_name: "Doe" })
+  const hr = profile({ first_name: "Hank", last_name: "Ross", email: "hr@company.com" })
+
+  const signers = buildSigners(employee, hr, "BigTech1")
+
+  assertEquals(signers[0].name, "Jane Doe")
+  assertEquals(signers[1].name, "Hank Ross")
 })

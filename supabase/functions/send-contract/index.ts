@@ -6,6 +6,7 @@ import { requireJwt, extractUserId } from "../_shared/auth.ts"
 import { makeRestClient, RestClient } from "../_shared/supabaseRest.ts"
 import { sendFcm } from "../_shared/fcm.ts"
 import { sendNotification } from "../_shared/notifications.ts"
+import { buildSigners, Signer } from "./signers.ts"
 
 // ─── Types ───────────────────────────────────────────────────────────────────
 
@@ -44,13 +45,6 @@ interface Bike {
   full_price: number
 }
 
-interface Signer {
-  name: string
-  email: string
-  phone: string
-  signing_order: number
-}
-
 interface EsigResult {
   contractId: string
   signerId: string | null
@@ -82,12 +76,16 @@ async function loadCompany(db: RestClient, companyId: string, origin?: string): 
 }
 
 async function loadHR(db: RestClient, companyId: string, origin?: string): Promise<Profile> {
+  // `profiles!inner` makes the company filter restrict the user_roles row
+  // itself. Without the inner join the `profiles.company_id` filter only
+  // scopes the embedded resource, so getOne could pick an `hr` role from
+  // ANOTHER company and return it with `profiles` nulled out.
   const row = await db.getOne<{ profiles: Profile }>(
     "user_roles",
     `role=eq.hr&profiles.company_id=eq.${companyId}`,
-    "profiles(first_name,last_name,email)"
+    "profiles!inner(first_name,last_name,email)"
   )
-  if (!row) throw badRequest(Errors.NO_HR, undefined, origin)
+  if (!row || !row.profiles) throw badRequest(Errors.NO_HR, undefined, origin)
   return row.profiles
 }
 
@@ -112,17 +110,6 @@ async function loadApiKey(db: RestClient, origin?: string): Promise<string> {
   const key = await db.rpc<string | null>("get_vault_secret", { secret_name: ESIGNATURES_VAULT_KEY })
   if (!key) throw json({ ...Errors.ESIGNATURES_API_FAILED, reason: "vault_secret_missing" }, 500, origin)
   return key
-}
-
-function mapProfileToSigner(...profiles: Profile[]): Signer[] {
-  return profiles
-    .filter(p => p && p.email && p.first_name) 
-    .map((profile, index) => ({
-       name: `${profile.first_name} ${profile.last_name}`.trim(),
-       email: profile.email,
-       phone: "+405505050",
-       signing_order: index+1
-    }))
 }
 
 // ─── eSignatures.com helpers ─────────────────────────────────────────────────
@@ -250,7 +237,7 @@ Deno.serve(async (req) => {
     const esigResult   = await callEsignaturesApi(
       apiKey,
       company.esignatures_template_id,
-      mapProfileToSigner(profile, hr),
+      buildSigners(profile, hr, company.name),
       placeholders,
       origin
     )
