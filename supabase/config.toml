@@ -463,6 +463,14 @@ verify_jwt = true
 import_map = "./functions/admin-encrypt-pii/deno.json"
 entrypoint = "./functions/admin-encrypt-pii/index.ts"
 
+# CO₂ engine — bulk recompute of employee_pii.commute_distance_km. Admin-only.
+# Run once to backfill after deploy; pass { company_id } after an office move.
+[functions.recompute-commute-distances]
+enabled = true
+verify_jwt = true
+import_map = "./functions/recompute-commute-distances/deno.json"
+entrypoint = "./functions/recompute-commute-distances/index.ts"
+
 # E2E test harness — seed/reset test accounts. Gated by X-E2E-Secret header.
 [functions.e2e-seed]
 enabled = true

@@ -43,7 +43,8 @@ import { Errors, badRequest, forbidden, json } from "../_shared/constants.ts"
 import { corsResponse } from "../_shared/ioHelpers.ts"
 import { requireJwt, extractUserId } from "../_shared/auth.ts"
 import { makeRestClient, type RestClient } from "../_shared/supabaseRest.ts"
-import { encrypt } from "../_shared/piiCrypto.ts"
+import { decrypt, encrypt } from "../_shared/piiCrypto.ts"
+import { commuteDistanceKm } from "../_shared/commute.ts"
 
 // ─── Field catalogues ───────────────────────────────────────────────────────
 
@@ -161,6 +162,72 @@ async function buildUpsertPayload(
   return { row, touchedFields: touched }
 }
 
+// ─── Derived commute distance (CO₂ / CSRD engine) ─────────────────────────────
+//
+// When home coords change, recompute the one-way detour-adjusted commute
+// distance against the company office (companies.address_lat/lon) and persist
+// the scalar `commute_distance_km` on the same row. Plaintext coords never
+// leave this runtime — only the derived number is stored. The recurring
+// per-company CO₂ aggregation (pg_cron) reads this scalar, never the PII.
+//
+// Mutates `row` in place. No-op unless the patch actually touches a home coord.
+async function attachCommuteDistance(
+  db: RestClient,
+  row: Record<string, unknown>,
+  targetUserId: string,
+  companyId: string,
+  patch: PatchBody,
+): Promise<void> {
+  const latTouched = Object.prototype.hasOwnProperty.call(patch, "home_lat")
+  const lonTouched = Object.prototype.hasOwnProperty.call(patch, "home_lon")
+  if (!latTouched && !lonTouched) return
+
+  // Office coords (plaintext on companies). Missing → distance is unknown.
+  const company = await db.getOne<{ address_lat: number | null; address_lon: number | null }>(
+    "companies",
+    `id=eq.${encodeURIComponent(companyId)}`,
+    "address_lat,address_lon",
+  )
+
+  // Effective home coords: patched value wins; otherwise the current stored
+  // (encrypted) value for the side that wasn't patched.
+  let homeLat: number | null
+  let homeLon: number | null
+  if (latTouched && lonTouched) {
+    homeLat = patch.home_lat as number | null
+    homeLon = patch.home_lon as number | null
+  } else {
+    const existing = await db.getOne<{ home_lat_encrypted: string | null; home_lon_encrypted: string | null }>(
+      "employee_pii",
+      `user_id=eq.${encodeURIComponent(targetUserId)}`,
+      "home_lat_encrypted,home_lon_encrypted",
+    )
+    homeLat = latTouched
+      ? (patch.home_lat as number | null)
+      : await decryptCoord(db, existing?.home_lat_encrypted ?? null)
+    homeLon = lonTouched
+      ? (patch.home_lon as number | null)
+      : await decryptCoord(db, existing?.home_lon_encrypted ?? null)
+  }
+
+  const result = await commuteDistanceKm(
+    db,
+    homeLat,
+    homeLon,
+    company?.address_lat ?? null,
+    company?.address_lon ?? null,
+  )
+  row.commute_distance_km = result?.km ?? null
+  row.commute_distance_source = result?.source ?? null
+  row.commute_distance_computed_at = new Date().toISOString()
+}
+
+async function decryptCoord(db: RestClient, enc: string | null): Promise<number | null> {
+  if (enc == null || enc === "") return null
+  const n = parseFloat(await decrypt(db, enc))
+  return Number.isFinite(n) ? n : null
+}
+
 // ─── Handler ────────────────────────────────────────────────────────────────
 
 Deno.serve(async (req) => {
@@ -237,6 +304,9 @@ Deno.serve(async (req) => {
       // Patch had only undefineds — no-op but still a 200. Don't write a row.
       return json({ ok: true, updated_fields: [] }, 200, origin)
     }
+
+    // Recompute the derived commute distance when home coords changed.
+    await attachCommuteDistance(db, row, targetUserId, targetProfile.company_id, body.patch)
 
     // employee_pii.user_id has a partial unique index (WHERE user_id IS NOT NULL)
     // to allow REGES-staged rows with user_id=NULL. PostgREST's `on_conflict=`

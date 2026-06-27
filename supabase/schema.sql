@@ -13,56 +13,13 @@ SET client_min_messages = warning;
 SET row_security = off;
 
 
-CREATE EXTENSION IF NOT EXISTS "pg_cron" WITH SCHEMA "pg_catalog";
+CREATE SCHEMA IF NOT EXISTS "public";
 
 
-
-
-
-
-CREATE EXTENSION IF NOT EXISTS "pg_net" WITH SCHEMA "extensions";
-
-
-
-
+ALTER SCHEMA "public" OWNER TO "pg_database_owner";
 
 
 COMMENT ON SCHEMA "public" IS 'standard public schema';
-
-
-
-CREATE EXTENSION IF NOT EXISTS "pg_stat_statements" WITH SCHEMA "extensions";
-
-
-
-
-
-
-CREATE EXTENSION IF NOT EXISTS "pg_trgm" WITH SCHEMA "public";
-
-
-
-
-
-
-CREATE EXTENSION IF NOT EXISTS "pgcrypto" WITH SCHEMA "extensions";
-
-
-
-
-
-
-CREATE EXTENSION IF NOT EXISTS "supabase_vault" WITH SCHEMA "vault";
-
-
-
-
-
-
-CREATE EXTENSION IF NOT EXISTS "uuid-ossp" WITH SCHEMA "extensions";
-
-
-
 
 
 
@@ -554,6 +511,36 @@ ALTER FUNCTION "public"."claim_next_sync_unit"("p_run_id" "uuid", "p_branch" "te
 
 COMMENT ON FUNCTION "public"."claim_next_sync_unit"("p_run_id" "uuid", "p_branch" "text", "p_lease_seconds" integer) IS 'Lease-based queue pop: claims an enqueued unit OR steals one whose lease expired (dead worker). FOR UPDATE SKIP LOCKED. Sets leased_until = now()+p_lease_seconds.';
 
+
+
+CREATE OR REPLACE FUNCTION "public"."co2_refresh_on_benefit_change"() RETURNS "trigger"
+    LANGUAGE "plpgsql" SECURITY DEFINER
+    SET "search_path" TO 'public'
+    AS $$
+DECLARE
+  v_co2 uuid[];
+  v_cnt uuid[];
+BEGIN
+  SELECT array_agg(DISTINCT ep.company_id) INTO v_co2
+  FROM changed_benefits cb JOIN public.employee_pii ep ON ep.user_id = cb.user_id
+  WHERE ep.company_id IS NOT NULL;
+
+  SELECT array_agg(DISTINCT p.company_id) INTO v_cnt
+  FROM changed_benefits cb JOIN public.profiles p ON p.user_id = cb.user_id
+  WHERE p.company_id IS NOT NULL;
+
+  IF v_co2 IS NOT NULL THEN
+    PERFORM public.refresh_company_co2_stats(date_trunc('week', now())::date, v_co2);
+  END IF;
+  IF v_cnt IS NOT NULL THEN
+    PERFORM public.refresh_company_metrics_counts(v_cnt);
+  END IF;
+  RETURN NULL;
+END;
+$$;
+
+
+ALTER FUNCTION "public"."co2_refresh_on_benefit_change"() OWNER TO "postgres";
 
 
 CREATE OR REPLACE FUNCTION "public"."complete_sync_unit"("p_unit_id" "uuid", "p_status" "text", "p_n_fetched" integer DEFAULT 0, "p_n_inserted" integer DEFAULT 0, "p_n_updated" integer DEFAULT 0, "p_n_models" integer DEFAULT 0, "p_n_failed" integer DEFAULT 0, "p_error" "text" DEFAULT NULL::"text") RETURNS "text"
@@ -1522,6 +1509,81 @@ COMMENT ON FUNCTION "public"."merge_bike_offers"("p_dealer_id" "uuid", "p_models
 
 
 
+CREATE OR REPLACE FUNCTION "public"."metrics_co2_on_stats_change"() RETURNS "trigger"
+    LANGUAGE "plpgsql" SECURITY DEFINER
+    SET "search_path" TO 'public'
+    AS $$
+DECLARE v_companies uuid[];
+BEGIN
+  SELECT array_agg(DISTINCT company_id) INTO v_companies
+  FROM changed_stats WHERE company_id IS NOT NULL;
+  IF v_companies IS NOT NULL THEN
+    PERFORM public.refresh_company_metrics_co2(v_companies);
+  END IF;
+  RETURN NULL;
+END;
+$$;
+
+
+ALTER FUNCTION "public"."metrics_co2_on_stats_change"() OWNER TO "postgres";
+
+
+CREATE OR REPLACE FUNCTION "public"."metrics_counts_on_invite_change"() RETURNS "trigger"
+    LANGUAGE "plpgsql" SECURITY DEFINER
+    SET "search_path" TO 'public'
+    AS $$
+DECLARE v_companies uuid[];
+BEGIN
+  SELECT array_agg(DISTINCT company_id) INTO v_companies
+  FROM changed_invites WHERE company_id IS NOT NULL;
+  IF v_companies IS NOT NULL THEN
+    PERFORM public.refresh_company_metrics_counts(v_companies);
+  END IF;
+  RETURN NULL;
+END;
+$$;
+
+
+ALTER FUNCTION "public"."metrics_counts_on_invite_change"() OWNER TO "postgres";
+
+
+CREATE OR REPLACE FUNCTION "public"."metrics_counts_on_invite_row"() RETURNS "trigger"
+    LANGUAGE "plpgsql" SECURITY DEFINER
+    SET "search_path" TO 'public'
+    AS $$
+BEGIN
+  PERFORM public.refresh_company_metrics_counts(
+    ARRAY(SELECT DISTINCT cid
+          FROM unnest(ARRAY[NEW.company_id, OLD.company_id]) AS cid
+          WHERE cid IS NOT NULL)
+  );
+  RETURN NULL;
+END;
+$$;
+
+
+ALTER FUNCTION "public"."metrics_counts_on_invite_row"() OWNER TO "postgres";
+
+
+CREATE OR REPLACE FUNCTION "public"."metrics_seed_on_company_insert"() RETURNS "trigger"
+    LANGUAGE "plpgsql" SECURITY DEFINER
+    SET "search_path" TO 'public'
+    AS $$
+DECLARE v_companies uuid[];
+BEGIN
+  SELECT array_agg(id) INTO v_companies FROM changed_companies;
+  IF v_companies IS NOT NULL THEN
+    PERFORM public.refresh_company_metrics_counts(v_companies);
+    PERFORM public.refresh_company_metrics_co2(v_companies);
+  END IF;
+  RETURN NULL;
+END;
+$$;
+
+
+ALTER FUNCTION "public"."metrics_seed_on_company_insert"() OWNER TO "postgres";
+
+
 CREATE OR REPLACE FUNCTION "public"."promote_sso_claim"("p_claim_id" "uuid", "p_invite_id" "uuid") RETURNS "jsonb"
     LANGUAGE "plpgsql" SECURITY DEFINER
     SET "search_path" TO 'public'
@@ -1600,6 +1662,116 @@ $$;
 
 
 ALTER FUNCTION "public"."promote_sso_claim"("p_claim_id" "uuid", "p_invite_id" "uuid") OWNER TO "postgres";
+
+
+CREATE OR REPLACE FUNCTION "public"."refresh_company_co2_stats"("p_period" "date" DEFAULT ("date_trunc"('week'::"text", "now"()))::"date", "p_company_ids" "uuid"[] DEFAULT NULL::"uuid"[]) RETURNS "void"
+    LANGUAGE "plpgsql" SECURITY DEFINER
+    SET "search_path" TO 'public'
+    AS $$
+DECLARE
+  -- Avg-car avoided-emissions factor, kg CO₂ per km. Identical to mobile's
+  -- RouteEstimations (CO2_KG_PER_LITER 2.31 / AVG_CAR_KM_PER_LITER 14.0).
+  v_emission_factor constant numeric := 0.165;
+BEGIN
+  -- LEFT JOIN LATERAL so EVERY company gets a current-week row: companies with
+  -- zero qualifying riders upsert to 0 (corrects a drop to zero), not a
+  -- missing/stale row.
+  INSERT INTO public.company_co2_stats AS s
+    (company_id, period, kg_co2_saved, active_riders, total_km, computed_at)
+  SELECT
+    c.id,
+    p_period,
+    COALESCE(round(sum(w.week_km * v_emission_factor)::numeric, 3), 0),
+    count(w.user_id),
+    COALESCE(round(sum(w.week_km)::numeric, 3), 0),
+    now()
+  FROM public.companies c
+  LEFT JOIN LATERAL (
+    SELECT
+      ep.user_id,
+      ep.commute_distance_km * 2 * COALESCE(c.days_in_office, 5) AS week_km
+    FROM public.employee_pii ep
+    JOIN public.bike_benefits bb ON bb.user_id = ep.user_id
+    WHERE ep.company_id = c.id
+      AND ep.user_id IS NOT NULL
+      AND ep.commute_distance_km IS NOT NULL
+      AND bb.delivered_at IS NOT NULL
+      AND bb.benefit_status = 'active'::public.benefit_status
+  ) w ON true
+  WHERE (p_company_ids IS NULL OR c.id = ANY (p_company_ids))
+  GROUP BY c.id
+  ON CONFLICT (company_id, period) DO UPDATE SET
+    kg_co2_saved  = EXCLUDED.kg_co2_saved,
+    active_riders = EXCLUDED.active_riders,
+    total_km      = EXCLUDED.total_km,
+    computed_at   = now();
+END;
+$$;
+
+
+ALTER FUNCTION "public"."refresh_company_co2_stats"("p_period" "date", "p_company_ids" "uuid"[]) OWNER TO "postgres";
+
+
+COMMENT ON FUNCTION "public"."refresh_company_co2_stats"("p_period" "date", "p_company_ids" "uuid"[]) IS 'Idempotent upsert of per-company commute-CO₂ stats for the given WEEK (default: current ISO week, Monday); p_company_ids restricts to specific companies (NULL = all, used by cron; the bike_benefits trigger passes the affected company for live updates). Pure SQL over employee_pii.commute_distance_km + bike_benefits lifecycle gate; never reads plaintext PII. Months/all-time roll up via company_co2_summary. See mobipass-backend skill references/co2-commute-engine.md.';
+
+
+
+CREATE OR REPLACE FUNCTION "public"."refresh_company_metrics_co2"("p_company_ids" "uuid"[] DEFAULT NULL::"uuid"[]) RETURNS "void"
+    LANGUAGE "plpgsql" SECURITY DEFINER
+    SET "search_path" TO 'public'
+    AS $$
+BEGIN
+  INSERT INTO public.company_metrics AS m
+    (company_id, co2_all_time_kg, co2_last_month_kg, co2_last_week_kg, co2_updated_at)
+  SELECT
+    c.id,
+    COALESCE(s.all_time_kg,   0),
+    COALESCE(s.last_month_kg, 0),
+    COALESCE(s.last_week_kg,  0),
+    now()
+  FROM public.companies c
+  LEFT JOIN public.company_co2_summary s ON s.company_id = c.id
+  WHERE (p_company_ids IS NULL OR c.id = ANY (p_company_ids))
+  ON CONFLICT (company_id) DO UPDATE SET
+    co2_all_time_kg   = EXCLUDED.co2_all_time_kg,
+    co2_last_month_kg = EXCLUDED.co2_last_month_kg,
+    co2_last_week_kg  = EXCLUDED.co2_last_week_kg,
+    co2_updated_at    = now();
+END;
+$$;
+
+
+ALTER FUNCTION "public"."refresh_company_metrics_co2"("p_company_ids" "uuid"[]) OWNER TO "postgres";
+
+
+CREATE OR REPLACE FUNCTION "public"."refresh_company_metrics_counts"("p_company_ids" "uuid"[] DEFAULT NULL::"uuid"[]) RETURNS "void"
+    LANGUAGE "plpgsql" SECURITY DEFINER
+    SET "search_path" TO 'public'
+    AS $$
+BEGIN
+  INSERT INTO public.company_metrics AS m
+    (company_id, total_accounts, active_accounts, active_benefits, counts_updated_at)
+  SELECT
+    c.id,
+    (SELECT count(*) FROM public.profile_invites pi WHERE pi.company_id = c.id),
+    (SELECT count(*) FROM public.profile_invites pi
+       WHERE pi.company_id = c.id AND pi.status = 'active'::public.user_profile_status),
+    (SELECT count(*) FROM public.bike_benefits bb
+       JOIN public.profiles p ON p.user_id = bb.user_id
+       WHERE p.company_id = c.id AND bb.benefit_status = 'active'::public.benefit_status),
+    now()
+  FROM public.companies c
+  WHERE (p_company_ids IS NULL OR c.id = ANY (p_company_ids))
+  ON CONFLICT (company_id) DO UPDATE SET
+    total_accounts    = EXCLUDED.total_accounts,
+    active_accounts   = EXCLUDED.active_accounts,
+    active_benefits   = EXCLUDED.active_benefits,
+    counts_updated_at = now();
+END;
+$$;
+
+
+ALTER FUNCTION "public"."refresh_company_metrics_counts"("p_company_ids" "uuid"[]) OWNER TO "postgres";
 
 
 CREATE OR REPLACE FUNCTION "public"."seed_audit_units"("p_run_id" "uuid") RETURNS "void"
@@ -1957,7 +2129,9 @@ CREATE TABLE IF NOT EXISTS "public"."bike_benefits" (
     "employee_contract_months" integer,
     "contract_declined_at" timestamp with time zone,
     "live_test_lat" double precision,
-    "live_test_lon" double precision
+    "live_test_lon" double precision,
+    "prior_commute_mode" "text",
+    CONSTRAINT "bike_benefits_prior_commute_mode_check" CHECK ((("prior_commute_mode" IS NULL) OR ("prior_commute_mode" = ANY (ARRAY['car'::"text", 'public_transit'::"text", 'bike'::"text", 'walk'::"text", 'motorcycle'::"text", 'other'::"text", 'unknown'::"text"]))))
 );
 
 
@@ -2025,6 +2199,10 @@ COMMENT ON COLUMN "public"."bike_benefits"."employee_contract_months" IS 'Contra
 
 
 COMMENT ON COLUMN "public"."bike_benefits"."contract_declined_at" IS 'Set by webhook when the employee declines the contract (signer-declined event). Drives contract_status → declined_by_employee via trigger.';
+
+
+
+COMMENT ON COLUMN "public"."bike_benefits"."prior_commute_mode" IS 'Rider''s commute mode before the e-bike, captured once at onboarding. Used to qualify the CSRD avoided-emissions baseline. NULL = unknown → v1 aggregation assumes the average-car baseline.';
 
 
 
@@ -2292,6 +2470,60 @@ COMMENT ON VIEW "public"."bikes_with_my_pricing" IS 'Bike catalog with employee-
 
 
 
+CREATE TABLE IF NOT EXISTS "public"."company_co2_stats" (
+    "company_id" "uuid" NOT NULL,
+    "period" "date" NOT NULL,
+    "kg_co2_saved" numeric DEFAULT 0 NOT NULL,
+    "active_riders" integer DEFAULT 0 NOT NULL,
+    "total_km" numeric DEFAULT 0 NOT NULL,
+    "computed_at" timestamp with time zone DEFAULT "now"() NOT NULL
+);
+
+
+ALTER TABLE "public"."company_co2_stats" OWNER TO "postgres";
+
+
+COMMENT ON TABLE "public"."company_co2_stats" IS 'Per-company WEEKLY commute-CO₂ aggregate (period = Monday of the ISO week) for the HR / CSRD dashboard. Populated only by the engine (refresh_company_co2_stats via pg_cron) — no client write path. Months/all-time roll up via company_co2_summary. kg_co2_saved is ESTIMATED AVOIDED emissions vs. an average-car baseline (NOT a Scope-3 inventory reduction). Methodology: mobipass-backend skill references/co2-commute-engine.md.';
+
+
+
+CREATE OR REPLACE VIEW "public"."company_co2_summary" WITH ("security_invoker"='on') AS
+ SELECT "company_id",
+    COALESCE("round"("sum"("kg_co2_saved"), 3), (0)::numeric) AS "all_time_kg",
+    COALESCE("round"("sum"("kg_co2_saved") FILTER (WHERE (("period" >= ("date_trunc"('month'::"text", ("now"() - '1 mon'::interval)))::"date") AND ("period" < ("date_trunc"('month'::"text", "now"()))::"date"))), 3), (0)::numeric) AS "last_month_kg",
+    COALESCE("round"("sum"("kg_co2_saved") FILTER (WHERE ("period" = ("date_trunc"('week'::"text", ("now"() - '7 days'::interval)))::"date")), 3), (0)::numeric) AS "last_week_kg",
+    COALESCE("round"("sum"("total_km"), 3), (0)::numeric) AS "all_time_km"
+   FROM "public"."company_co2_stats"
+  GROUP BY "company_id";
+
+
+ALTER VIEW "public"."company_co2_summary" OWNER TO "postgres";
+
+
+COMMENT ON VIEW "public"."company_co2_summary" IS 'HR-console read model: one RLS-scoped row per company with commute-CO₂ totals per timeframe (all_time_kg, last_month_kg, last_week_kg, all_time_km). Frontend reads its row and picks the column for the selected timeframe — no client-side summing. last-day is intentionally omitted (below the weekly model resolution).';
+
+
+
+CREATE TABLE IF NOT EXISTS "public"."company_metrics" (
+    "company_id" "uuid" NOT NULL,
+    "total_accounts" integer DEFAULT 0 NOT NULL,
+    "active_accounts" integer DEFAULT 0 NOT NULL,
+    "active_benefits" integer DEFAULT 0 NOT NULL,
+    "co2_all_time_kg" numeric DEFAULT 0 NOT NULL,
+    "co2_last_month_kg" numeric DEFAULT 0 NOT NULL,
+    "co2_last_week_kg" numeric DEFAULT 0 NOT NULL,
+    "counts_updated_at" timestamp with time zone,
+    "co2_updated_at" timestamp with time zone
+);
+
+
+ALTER TABLE "public"."company_metrics" OWNER TO "postgres";
+
+
+COMMENT ON TABLE "public"."company_metrics" IS 'Per-company HR-console KPI projection (one row/company): account/benefit counts + commute-CO₂ roll-ups (all-time / last-month / last-week; last-day omitted — sub-week has no honest resolution). Engine-maintained via triggers; no client write path. Realtime-published. company_co2_stats remains the authoritative weekly time-series. Frontend reads this single row + subscribes to it. Skill: references/co2-commute-engine.md.';
+
+
+
 CREATE TABLE IF NOT EXISTS "public"."company_notifications" (
     "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,
     "company_id" "uuid" NOT NULL,
@@ -2379,7 +2611,11 @@ CREATE TABLE IF NOT EXISTS "public"."employee_pii" (
     "source_ref_id" "text",
     "created_at" timestamp with time zone DEFAULT "now"() NOT NULL,
     "updated_at" timestamp with time zone DEFAULT "now"() NOT NULL,
-    "profile_invite_id" "uuid"
+    "profile_invite_id" "uuid",
+    "commute_distance_km" numeric,
+    "commute_distance_computed_at" timestamp with time zone,
+    "commute_distance_source" "text",
+    CONSTRAINT "employee_pii_commute_distance_source_check" CHECK ((("commute_distance_source" IS NULL) OR ("commute_distance_source" = ANY (ARRAY['routed'::"text", 'estimated'::"text"]))))
 );
 
 
@@ -2387,6 +2623,14 @@ ALTER TABLE "public"."employee_pii" OWNER TO "postgres";
 
 
 COMMENT ON COLUMN "public"."employee_pii"."profile_invite_id" IS 'Links a REGES-staged PII row to its profile_invites row. Lets handle_user_registration backfill employee_pii.user_id when the matching invite is claimed.';
+
+
+
+COMMENT ON COLUMN "public"."employee_pii"."commute_distance_km" IS 'Derived one-way commute distance home→office in km. Computed in the edge runtime (update-employee-pii / recompute-commute-distances) from decrypted home coords + companies.address_lat/lon. NULL when coords are missing. Consumed by the per-company CO₂ aggregation (refresh_company_co2_stats); never exposed per-employee to HR.';
+
+
+
+COMMENT ON COLUMN "public"."employee_pii"."commute_distance_source" IS 'Provenance of commute_distance_km (CSRD auditability): ''estimated'' = haversine × 1.3 detour (the v1 default, no external dependency); ''routed'' = OpenRouteService driving-car road distance (opt-in, only when ors_base_url is configured — intended for a self-hosted ORS).';
 
 
 
@@ -2739,6 +2983,16 @@ ALTER TABLE ONLY "public"."companies"
 
 ALTER TABLE ONLY "public"."companies"
     ADD CONSTRAINT "companies_pkey" PRIMARY KEY ("id");
+
+
+
+ALTER TABLE ONLY "public"."company_co2_stats"
+    ADD CONSTRAINT "company_co2_stats_pkey" PRIMARY KEY ("company_id", "period");
+
+
+
+ALTER TABLE ONLY "public"."company_metrics"
+    ADD CONSTRAINT "company_metrics_pkey" PRIMARY KEY ("company_id");
 
 
 
@@ -3097,6 +3351,46 @@ CREATE OR REPLACE VIEW "public"."sync_run_summary" WITH ("security_invoker"='on'
 
 
 
+CREATE OR REPLACE TRIGGER "co2_refresh_benefit_del" AFTER DELETE ON "public"."bike_benefits" REFERENCING OLD TABLE AS "changed_benefits" FOR EACH STATEMENT EXECUTE FUNCTION "public"."co2_refresh_on_benefit_change"();
+
+
+
+CREATE OR REPLACE TRIGGER "co2_refresh_benefit_ins" AFTER INSERT ON "public"."bike_benefits" REFERENCING NEW TABLE AS "changed_benefits" FOR EACH STATEMENT EXECUTE FUNCTION "public"."co2_refresh_on_benefit_change"();
+
+
+
+CREATE OR REPLACE TRIGGER "co2_refresh_benefit_upd" AFTER UPDATE ON "public"."bike_benefits" REFERENCING NEW TABLE AS "changed_benefits" FOR EACH STATEMENT EXECUTE FUNCTION "public"."co2_refresh_on_benefit_change"();
+
+
+
+CREATE OR REPLACE TRIGGER "metrics_co2_stats_del" AFTER DELETE ON "public"."company_co2_stats" REFERENCING OLD TABLE AS "changed_stats" FOR EACH STATEMENT EXECUTE FUNCTION "public"."metrics_co2_on_stats_change"();
+
+
+
+CREATE OR REPLACE TRIGGER "metrics_co2_stats_ins" AFTER INSERT ON "public"."company_co2_stats" REFERENCING NEW TABLE AS "changed_stats" FOR EACH STATEMENT EXECUTE FUNCTION "public"."metrics_co2_on_stats_change"();
+
+
+
+CREATE OR REPLACE TRIGGER "metrics_co2_stats_upd" AFTER UPDATE ON "public"."company_co2_stats" REFERENCING NEW TABLE AS "changed_stats" FOR EACH STATEMENT EXECUTE FUNCTION "public"."metrics_co2_on_stats_change"();
+
+
+
+CREATE OR REPLACE TRIGGER "metrics_counts_invite_del" AFTER DELETE ON "public"."profile_invites" REFERENCING OLD TABLE AS "changed_invites" FOR EACH STATEMENT EXECUTE FUNCTION "public"."metrics_counts_on_invite_change"();
+
+
+
+CREATE OR REPLACE TRIGGER "metrics_counts_invite_ins" AFTER INSERT ON "public"."profile_invites" REFERENCING NEW TABLE AS "changed_invites" FOR EACH STATEMENT EXECUTE FUNCTION "public"."metrics_counts_on_invite_change"();
+
+
+
+CREATE OR REPLACE TRIGGER "metrics_counts_invite_upd" AFTER UPDATE OF "status", "company_id" ON "public"."profile_invites" FOR EACH ROW EXECUTE FUNCTION "public"."metrics_counts_on_invite_row"();
+
+
+
+CREATE OR REPLACE TRIGGER "metrics_seed_company_ins" AFTER INSERT ON "public"."companies" REFERENCING NEW TABLE AS "changed_companies" FOR EACH STATEMENT EXECUTE FUNCTION "public"."metrics_seed_on_company_insert"();
+
+
+
 CREATE OR REPLACE TRIGGER "set_contracts_updated_at" BEFORE UPDATE ON "public"."contracts" FOR EACH ROW EXECUTE FUNCTION "public"."update_updated_at_column"();
 
 
@@ -3186,6 +3480,16 @@ ALTER TABLE ONLY "public"."bikes"
 
 ALTER TABLE ONLY "public"."bikes"
     ADD CONSTRAINT "bikes_model_id_fkey" FOREIGN KEY ("model_id") REFERENCES "public"."bike_models"("id") ON DELETE RESTRICT;
+
+
+
+ALTER TABLE ONLY "public"."company_co2_stats"
+    ADD CONSTRAINT "company_co2_stats_company_id_fkey" FOREIGN KEY ("company_id") REFERENCES "public"."companies"("id") ON DELETE CASCADE;
+
+
+
+ALTER TABLE ONLY "public"."company_metrics"
+    ADD CONSTRAINT "company_metrics_company_id_fkey" FOREIGN KEY ("company_id") REFERENCES "public"."companies"("id") ON DELETE CASCADE;
 
 
 
@@ -3466,6 +3770,20 @@ CREATE POLICY "companies_hr_update" ON "public"."companies" FOR UPDATE TO "authe
 
 
 
+ALTER TABLE "public"."company_co2_stats" ENABLE ROW LEVEL SECURITY;
+
+
+CREATE POLICY "company_co2_stats_hr_select" ON "public"."company_co2_stats" FOR SELECT TO "authenticated" USING (((("auth"."jwt"() ->> 'user_role'::"text") = ANY (ARRAY['hr'::"text", 'admin'::"text"])) AND ("company_id" = ( SELECT "public"."auth_company_id"() AS "auth_company_id"))));
+
+
+
+ALTER TABLE "public"."company_metrics" ENABLE ROW LEVEL SECURITY;
+
+
+CREATE POLICY "company_metrics_hr_select" ON "public"."company_metrics" FOR SELECT TO "authenticated" USING (((("auth"."jwt"() ->> 'user_role'::"text") = ANY (ARRAY['hr'::"text", 'admin'::"text"])) AND ("company_id" = ( SELECT "public"."auth_company_id"() AS "auth_company_id"))));
+
+
+
 ALTER TABLE "public"."company_notifications" ENABLE ROW LEVEL SECURITY;
 
 
@@ -3604,220 +3922,11 @@ CREATE POLICY "user_roles_hr_select" ON "public"."user_roles" FOR SELECT TO "aut
 
 
 
-
-
-ALTER PUBLICATION "supabase_realtime" OWNER TO "postgres";
-
-
-
-
-
-
-ALTER PUBLICATION "supabase_realtime" ADD TABLE ONLY "public"."bike_benefits";
-
-
-
-ALTER PUBLICATION "supabase_realtime" ADD TABLE ONLY "public"."company_notifications";
-
-
-
-ALTER PUBLICATION "supabase_realtime" ADD TABLE ONLY "public"."profiles";
-
-
-
-
-
-
-
-
-
 GRANT USAGE ON SCHEMA "public" TO "postgres";
 GRANT USAGE ON SCHEMA "public" TO "anon";
 GRANT USAGE ON SCHEMA "public" TO "authenticated";
 GRANT USAGE ON SCHEMA "public" TO "service_role";
 GRANT USAGE ON SCHEMA "public" TO "supabase_auth_admin";
-
-
-
-GRANT ALL ON FUNCTION "public"."gtrgm_in"("cstring") TO "postgres";
-GRANT ALL ON FUNCTION "public"."gtrgm_in"("cstring") TO "anon";
-GRANT ALL ON FUNCTION "public"."gtrgm_in"("cstring") TO "authenticated";
-GRANT ALL ON FUNCTION "public"."gtrgm_in"("cstring") TO "service_role";
-
-
-
-GRANT ALL ON FUNCTION "public"."gtrgm_out"("public"."gtrgm") TO "postgres";
-GRANT ALL ON FUNCTION "public"."gtrgm_out"("public"."gtrgm") TO "anon";
-GRANT ALL ON FUNCTION "public"."gtrgm_out"("public"."gtrgm") TO "authenticated";
-GRANT ALL ON FUNCTION "public"."gtrgm_out"("public"."gtrgm") TO "service_role";
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 
 
@@ -3872,6 +3981,13 @@ GRANT ALL ON TABLE "public"."sync_units" TO "service_role";
 GRANT ALL ON FUNCTION "public"."claim_next_sync_unit"("p_run_id" "uuid", "p_branch" "text", "p_lease_seconds" integer) TO "anon";
 GRANT ALL ON FUNCTION "public"."claim_next_sync_unit"("p_run_id" "uuid", "p_branch" "text", "p_lease_seconds" integer) TO "authenticated";
 GRANT ALL ON FUNCTION "public"."claim_next_sync_unit"("p_run_id" "uuid", "p_branch" "text", "p_lease_seconds" integer) TO "service_role";
+
+
+
+REVOKE ALL ON FUNCTION "public"."co2_refresh_on_benefit_change"() FROM PUBLIC;
+GRANT ALL ON FUNCTION "public"."co2_refresh_on_benefit_change"() TO "anon";
+GRANT ALL ON FUNCTION "public"."co2_refresh_on_benefit_change"() TO "authenticated";
+GRANT ALL ON FUNCTION "public"."co2_refresh_on_benefit_change"() TO "service_role";
 
 
 
@@ -3942,97 +4058,6 @@ GRANT ALL ON FUNCTION "public"."get_vault_secret"("secret_name" "text") TO "serv
 
 
 
-GRANT ALL ON FUNCTION "public"."gin_extract_query_trgm"("text", "internal", smallint, "internal", "internal", "internal", "internal") TO "postgres";
-GRANT ALL ON FUNCTION "public"."gin_extract_query_trgm"("text", "internal", smallint, "internal", "internal", "internal", "internal") TO "anon";
-GRANT ALL ON FUNCTION "public"."gin_extract_query_trgm"("text", "internal", smallint, "internal", "internal", "internal", "internal") TO "authenticated";
-GRANT ALL ON FUNCTION "public"."gin_extract_query_trgm"("text", "internal", smallint, "internal", "internal", "internal", "internal") TO "service_role";
-
-
-
-GRANT ALL ON FUNCTION "public"."gin_extract_value_trgm"("text", "internal") TO "postgres";
-GRANT ALL ON FUNCTION "public"."gin_extract_value_trgm"("text", "internal") TO "anon";
-GRANT ALL ON FUNCTION "public"."gin_extract_value_trgm"("text", "internal") TO "authenticated";
-GRANT ALL ON FUNCTION "public"."gin_extract_value_trgm"("text", "internal") TO "service_role";
-
-
-
-GRANT ALL ON FUNCTION "public"."gin_trgm_consistent"("internal", smallint, "text", integer, "internal", "internal", "internal", "internal") TO "postgres";
-GRANT ALL ON FUNCTION "public"."gin_trgm_consistent"("internal", smallint, "text", integer, "internal", "internal", "internal", "internal") TO "anon";
-GRANT ALL ON FUNCTION "public"."gin_trgm_consistent"("internal", smallint, "text", integer, "internal", "internal", "internal", "internal") TO "authenticated";
-GRANT ALL ON FUNCTION "public"."gin_trgm_consistent"("internal", smallint, "text", integer, "internal", "internal", "internal", "internal") TO "service_role";
-
-
-
-GRANT ALL ON FUNCTION "public"."gin_trgm_triconsistent"("internal", smallint, "text", integer, "internal", "internal", "internal") TO "postgres";
-GRANT ALL ON FUNCTION "public"."gin_trgm_triconsistent"("internal", smallint, "text", integer, "internal", "internal", "internal") TO "anon";
-GRANT ALL ON FUNCTION "public"."gin_trgm_triconsistent"("internal", smallint, "text", integer, "internal", "internal", "internal") TO "authenticated";
-GRANT ALL ON FUNCTION "public"."gin_trgm_triconsistent"("internal", smallint, "text", integer, "internal", "internal", "internal") TO "service_role";
-
-
-
-GRANT ALL ON FUNCTION "public"."gtrgm_compress"("internal") TO "postgres";
-GRANT ALL ON FUNCTION "public"."gtrgm_compress"("internal") TO "anon";
-GRANT ALL ON FUNCTION "public"."gtrgm_compress"("internal") TO "authenticated";
-GRANT ALL ON FUNCTION "public"."gtrgm_compress"("internal") TO "service_role";
-
-
-
-GRANT ALL ON FUNCTION "public"."gtrgm_consistent"("internal", "text", smallint, "oid", "internal") TO "postgres";
-GRANT ALL ON FUNCTION "public"."gtrgm_consistent"("internal", "text", smallint, "oid", "internal") TO "anon";
-GRANT ALL ON FUNCTION "public"."gtrgm_consistent"("internal", "text", smallint, "oid", "internal") TO "authenticated";
-GRANT ALL ON FUNCTION "public"."gtrgm_consistent"("internal", "text", smallint, "oid", "internal") TO "service_role";
-
-
-
-GRANT ALL ON FUNCTION "public"."gtrgm_decompress"("internal") TO "postgres";
-GRANT ALL ON FUNCTION "public"."gtrgm_decompress"("internal") TO "anon";
-GRANT ALL ON FUNCTION "public"."gtrgm_decompress"("internal") TO "authenticated";
-GRANT ALL ON FUNCTION "public"."gtrgm_decompress"("internal") TO "service_role";
-
-
-
-GRANT ALL ON FUNCTION "public"."gtrgm_distance"("internal", "text", smallint, "oid", "internal") TO "postgres";
-GRANT ALL ON FUNCTION "public"."gtrgm_distance"("internal", "text", smallint, "oid", "internal") TO "anon";
-GRANT ALL ON FUNCTION "public"."gtrgm_distance"("internal", "text", smallint, "oid", "internal") TO "authenticated";
-GRANT ALL ON FUNCTION "public"."gtrgm_distance"("internal", "text", smallint, "oid", "internal") TO "service_role";
-
-
-
-GRANT ALL ON FUNCTION "public"."gtrgm_options"("internal") TO "postgres";
-GRANT ALL ON FUNCTION "public"."gtrgm_options"("internal") TO "anon";
-GRANT ALL ON FUNCTION "public"."gtrgm_options"("internal") TO "authenticated";
-GRANT ALL ON FUNCTION "public"."gtrgm_options"("internal") TO "service_role";
-
-
-
-GRANT ALL ON FUNCTION "public"."gtrgm_penalty"("internal", "internal", "internal") TO "postgres";
-GRANT ALL ON FUNCTION "public"."gtrgm_penalty"("internal", "internal", "internal") TO "anon";
-GRANT ALL ON FUNCTION "public"."gtrgm_penalty"("internal", "internal", "internal") TO "authenticated";
-GRANT ALL ON FUNCTION "public"."gtrgm_penalty"("internal", "internal", "internal") TO "service_role";
-
-
-
-GRANT ALL ON FUNCTION "public"."gtrgm_picksplit"("internal", "internal") TO "postgres";
-GRANT ALL ON FUNCTION "public"."gtrgm_picksplit"("internal", "internal") TO "anon";
-GRANT ALL ON FUNCTION "public"."gtrgm_picksplit"("internal", "internal") TO "authenticated";
-GRANT ALL ON FUNCTION "public"."gtrgm_picksplit"("internal", "internal") TO "service_role";
-
-
-
-GRANT ALL ON FUNCTION "public"."gtrgm_same"("public"."gtrgm", "public"."gtrgm", "internal") TO "postgres";
-GRANT ALL ON FUNCTION "public"."gtrgm_same"("public"."gtrgm", "public"."gtrgm", "internal") TO "anon";
-GRANT ALL ON FUNCTION "public"."gtrgm_same"("public"."gtrgm", "public"."gtrgm", "internal") TO "authenticated";
-GRANT ALL ON FUNCTION "public"."gtrgm_same"("public"."gtrgm", "public"."gtrgm", "internal") TO "service_role";
-
-
-
-GRANT ALL ON FUNCTION "public"."gtrgm_union"("internal", "internal") TO "postgres";
-GRANT ALL ON FUNCTION "public"."gtrgm_union"("internal", "internal") TO "anon";
-GRANT ALL ON FUNCTION "public"."gtrgm_union"("internal", "internal") TO "authenticated";
-GRANT ALL ON FUNCTION "public"."gtrgm_union"("internal", "internal") TO "service_role";
-
-
-
 GRANT ALL ON FUNCTION "public"."handle_user_registration"() TO "anon";
 GRANT ALL ON FUNCTION "public"."handle_user_registration"() TO "authenticated";
 GRANT ALL ON FUNCTION "public"."handle_user_registration"() TO "service_role";
@@ -4057,57 +4082,64 @@ GRANT ALL ON FUNCTION "public"."merge_bike_offers"("p_dealer_id" "uuid", "p_mode
 
 
 
+REVOKE ALL ON FUNCTION "public"."metrics_co2_on_stats_change"() FROM PUBLIC;
+GRANT ALL ON FUNCTION "public"."metrics_co2_on_stats_change"() TO "anon";
+GRANT ALL ON FUNCTION "public"."metrics_co2_on_stats_change"() TO "authenticated";
+GRANT ALL ON FUNCTION "public"."metrics_co2_on_stats_change"() TO "service_role";
+
+
+
+REVOKE ALL ON FUNCTION "public"."metrics_counts_on_invite_change"() FROM PUBLIC;
+GRANT ALL ON FUNCTION "public"."metrics_counts_on_invite_change"() TO "anon";
+GRANT ALL ON FUNCTION "public"."metrics_counts_on_invite_change"() TO "authenticated";
+GRANT ALL ON FUNCTION "public"."metrics_counts_on_invite_change"() TO "service_role";
+
+
+
+REVOKE ALL ON FUNCTION "public"."metrics_counts_on_invite_row"() FROM PUBLIC;
+GRANT ALL ON FUNCTION "public"."metrics_counts_on_invite_row"() TO "anon";
+GRANT ALL ON FUNCTION "public"."metrics_counts_on_invite_row"() TO "authenticated";
+GRANT ALL ON FUNCTION "public"."metrics_counts_on_invite_row"() TO "service_role";
+
+
+
+REVOKE ALL ON FUNCTION "public"."metrics_seed_on_company_insert"() FROM PUBLIC;
+GRANT ALL ON FUNCTION "public"."metrics_seed_on_company_insert"() TO "anon";
+GRANT ALL ON FUNCTION "public"."metrics_seed_on_company_insert"() TO "authenticated";
+GRANT ALL ON FUNCTION "public"."metrics_seed_on_company_insert"() TO "service_role";
+
+
+
 GRANT ALL ON FUNCTION "public"."promote_sso_claim"("p_claim_id" "uuid", "p_invite_id" "uuid") TO "anon";
 GRANT ALL ON FUNCTION "public"."promote_sso_claim"("p_claim_id" "uuid", "p_invite_id" "uuid") TO "authenticated";
 GRANT ALL ON FUNCTION "public"."promote_sso_claim"("p_claim_id" "uuid", "p_invite_id" "uuid") TO "service_role";
 
 
 
+REVOKE ALL ON FUNCTION "public"."refresh_company_co2_stats"("p_period" "date", "p_company_ids" "uuid"[]) FROM PUBLIC;
+GRANT ALL ON FUNCTION "public"."refresh_company_co2_stats"("p_period" "date", "p_company_ids" "uuid"[]) TO "anon";
+GRANT ALL ON FUNCTION "public"."refresh_company_co2_stats"("p_period" "date", "p_company_ids" "uuid"[]) TO "authenticated";
+GRANT ALL ON FUNCTION "public"."refresh_company_co2_stats"("p_period" "date", "p_company_ids" "uuid"[]) TO "service_role";
+
+
+
+REVOKE ALL ON FUNCTION "public"."refresh_company_metrics_co2"("p_company_ids" "uuid"[]) FROM PUBLIC;
+GRANT ALL ON FUNCTION "public"."refresh_company_metrics_co2"("p_company_ids" "uuid"[]) TO "anon";
+GRANT ALL ON FUNCTION "public"."refresh_company_metrics_co2"("p_company_ids" "uuid"[]) TO "authenticated";
+GRANT ALL ON FUNCTION "public"."refresh_company_metrics_co2"("p_company_ids" "uuid"[]) TO "service_role";
+
+
+
+REVOKE ALL ON FUNCTION "public"."refresh_company_metrics_counts"("p_company_ids" "uuid"[]) FROM PUBLIC;
+GRANT ALL ON FUNCTION "public"."refresh_company_metrics_counts"("p_company_ids" "uuid"[]) TO "anon";
+GRANT ALL ON FUNCTION "public"."refresh_company_metrics_counts"("p_company_ids" "uuid"[]) TO "authenticated";
+GRANT ALL ON FUNCTION "public"."refresh_company_metrics_counts"("p_company_ids" "uuid"[]) TO "service_role";
+
+
+
 GRANT ALL ON FUNCTION "public"."seed_audit_units"("p_run_id" "uuid") TO "anon";
 GRANT ALL ON FUNCTION "public"."seed_audit_units"("p_run_id" "uuid") TO "authenticated";
 GRANT ALL ON FUNCTION "public"."seed_audit_units"("p_run_id" "uuid") TO "service_role";
-
-
-
-GRANT ALL ON FUNCTION "public"."set_limit"(real) TO "postgres";
-GRANT ALL ON FUNCTION "public"."set_limit"(real) TO "anon";
-GRANT ALL ON FUNCTION "public"."set_limit"(real) TO "authenticated";
-GRANT ALL ON FUNCTION "public"."set_limit"(real) TO "service_role";
-
-
-
-GRANT ALL ON FUNCTION "public"."show_limit"() TO "postgres";
-GRANT ALL ON FUNCTION "public"."show_limit"() TO "anon";
-GRANT ALL ON FUNCTION "public"."show_limit"() TO "authenticated";
-GRANT ALL ON FUNCTION "public"."show_limit"() TO "service_role";
-
-
-
-GRANT ALL ON FUNCTION "public"."show_trgm"("text") TO "postgres";
-GRANT ALL ON FUNCTION "public"."show_trgm"("text") TO "anon";
-GRANT ALL ON FUNCTION "public"."show_trgm"("text") TO "authenticated";
-GRANT ALL ON FUNCTION "public"."show_trgm"("text") TO "service_role";
-
-
-
-GRANT ALL ON FUNCTION "public"."similarity"("text", "text") TO "postgres";
-GRANT ALL ON FUNCTION "public"."similarity"("text", "text") TO "anon";
-GRANT ALL ON FUNCTION "public"."similarity"("text", "text") TO "authenticated";
-GRANT ALL ON FUNCTION "public"."similarity"("text", "text") TO "service_role";
-
-
-
-GRANT ALL ON FUNCTION "public"."similarity_dist"("text", "text") TO "postgres";
-GRANT ALL ON FUNCTION "public"."similarity_dist"("text", "text") TO "anon";
-GRANT ALL ON FUNCTION "public"."similarity_dist"("text", "text") TO "authenticated";
-GRANT ALL ON FUNCTION "public"."similarity_dist"("text", "text") TO "service_role";
-
-
-
-GRANT ALL ON FUNCTION "public"."similarity_op"("text", "text") TO "postgres";
-GRANT ALL ON FUNCTION "public"."similarity_op"("text", "text") TO "anon";
-GRANT ALL ON FUNCTION "public"."similarity_op"("text", "text") TO "authenticated";
-GRANT ALL ON FUNCTION "public"."similarity_op"("text", "text") TO "service_role";
 
 
 
@@ -4120,41 +4152,6 @@ GRANT ALL ON TABLE "public"."bikes" TO "service_role";
 GRANT ALL ON FUNCTION "public"."specifications"("b" "public"."bikes") TO "anon";
 GRANT ALL ON FUNCTION "public"."specifications"("b" "public"."bikes") TO "authenticated";
 GRANT ALL ON FUNCTION "public"."specifications"("b" "public"."bikes") TO "service_role";
-
-
-
-GRANT ALL ON FUNCTION "public"."strict_word_similarity"("text", "text") TO "postgres";
-GRANT ALL ON FUNCTION "public"."strict_word_similarity"("text", "text") TO "anon";
-GRANT ALL ON FUNCTION "public"."strict_word_similarity"("text", "text") TO "authenticated";
-GRANT ALL ON FUNCTION "public"."strict_word_similarity"("text", "text") TO "service_role";
-
-
-
-GRANT ALL ON FUNCTION "public"."strict_word_similarity_commutator_op"("text", "text") TO "postgres";
-GRANT ALL ON FUNCTION "public"."strict_word_similarity_commutator_op"("text", "text") TO "anon";
-GRANT ALL ON FUNCTION "public"."strict_word_similarity_commutator_op"("text", "text") TO "authenticated";
-GRANT ALL ON FUNCTION "public"."strict_word_similarity_commutator_op"("text", "text") TO "service_role";
-
-
-
-GRANT ALL ON FUNCTION "public"."strict_word_similarity_dist_commutator_op"("text", "text") TO "postgres";
-GRANT ALL ON FUNCTION "public"."strict_word_similarity_dist_commutator_op"("text", "text") TO "anon";
-GRANT ALL ON FUNCTION "public"."strict_word_similarity_dist_commutator_op"("text", "text") TO "authenticated";
-GRANT ALL ON FUNCTION "public"."strict_word_similarity_dist_commutator_op"("text", "text") TO "service_role";
-
-
-
-GRANT ALL ON FUNCTION "public"."strict_word_similarity_dist_op"("text", "text") TO "postgres";
-GRANT ALL ON FUNCTION "public"."strict_word_similarity_dist_op"("text", "text") TO "anon";
-GRANT ALL ON FUNCTION "public"."strict_word_similarity_dist_op"("text", "text") TO "authenticated";
-GRANT ALL ON FUNCTION "public"."strict_word_similarity_dist_op"("text", "text") TO "service_role";
-
-
-
-GRANT ALL ON FUNCTION "public"."strict_word_similarity_op"("text", "text") TO "postgres";
-GRANT ALL ON FUNCTION "public"."strict_word_similarity_op"("text", "text") TO "anon";
-GRANT ALL ON FUNCTION "public"."strict_word_similarity_op"("text", "text") TO "authenticated";
-GRANT ALL ON FUNCTION "public"."strict_word_similarity_op"("text", "text") TO "service_role";
 
 
 
@@ -4185,62 +4182,6 @@ GRANT ALL ON FUNCTION "public"."update_contract_status"() TO "service_role";
 GRANT ALL ON FUNCTION "public"."update_updated_at_column"() TO "anon";
 GRANT ALL ON FUNCTION "public"."update_updated_at_column"() TO "authenticated";
 GRANT ALL ON FUNCTION "public"."update_updated_at_column"() TO "service_role";
-
-
-
-GRANT ALL ON FUNCTION "public"."word_similarity"("text", "text") TO "postgres";
-GRANT ALL ON FUNCTION "public"."word_similarity"("text", "text") TO "anon";
-GRANT ALL ON FUNCTION "public"."word_similarity"("text", "text") TO "authenticated";
-GRANT ALL ON FUNCTION "public"."word_similarity"("text", "text") TO "service_role";
-
-
-
-GRANT ALL ON FUNCTION "public"."word_similarity_commutator_op"("text", "text") TO "postgres";
-GRANT ALL ON FUNCTION "public"."word_similarity_commutator_op"("text", "text") TO "anon";
-GRANT ALL ON FUNCTION "public"."word_similarity_commutator_op"("text", "text") TO "authenticated";
-GRANT ALL ON FUNCTION "public"."word_similarity_commutator_op"("text", "text") TO "service_role";
-
-
-
-GRANT ALL ON FUNCTION "public"."word_similarity_dist_commutator_op"("text", "text") TO "postgres";
-GRANT ALL ON FUNCTION "public"."word_similarity_dist_commutator_op"("text", "text") TO "anon";
-GRANT ALL ON FUNCTION "public"."word_similarity_dist_commutator_op"("text", "text") TO "authenticated";
-GRANT ALL ON FUNCTION "public"."word_similarity_dist_commutator_op"("text", "text") TO "service_role";
-
-
-
-GRANT ALL ON FUNCTION "public"."word_similarity_dist_op"("text", "text") TO "postgres";
-GRANT ALL ON FUNCTION "public"."word_similarity_dist_op"("text", "text") TO "anon";
-GRANT ALL ON FUNCTION "public"."word_similarity_dist_op"("text", "text") TO "authenticated";
-GRANT ALL ON FUNCTION "public"."word_similarity_dist_op"("text", "text") TO "service_role";
-
-
-
-GRANT ALL ON FUNCTION "public"."word_similarity_op"("text", "text") TO "postgres";
-GRANT ALL ON FUNCTION "public"."word_similarity_op"("text", "text") TO "anon";
-GRANT ALL ON FUNCTION "public"."word_similarity_op"("text", "text") TO "authenticated";
-GRANT ALL ON FUNCTION "public"."word_similarity_op"("text", "text") TO "service_role";
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 
 
@@ -4283,6 +4224,24 @@ GRANT ALL ON TABLE "public"."profiles" TO "service_role";
 GRANT ALL ON TABLE "public"."bikes_with_my_pricing" TO "anon";
 GRANT ALL ON TABLE "public"."bikes_with_my_pricing" TO "authenticated";
 GRANT ALL ON TABLE "public"."bikes_with_my_pricing" TO "service_role";
+
+
+
+GRANT ALL ON TABLE "public"."company_co2_stats" TO "anon";
+GRANT ALL ON TABLE "public"."company_co2_stats" TO "authenticated";
+GRANT ALL ON TABLE "public"."company_co2_stats" TO "service_role";
+
+
+
+GRANT ALL ON TABLE "public"."company_co2_summary" TO "anon";
+GRANT ALL ON TABLE "public"."company_co2_summary" TO "authenticated";
+GRANT ALL ON TABLE "public"."company_co2_summary" TO "service_role";
+
+
+
+GRANT ALL ON TABLE "public"."company_metrics" TO "anon";
+GRANT ALL ON TABLE "public"."company_metrics" TO "authenticated";
+GRANT ALL ON TABLE "public"."company_metrics" TO "service_role";
 
 
 
@@ -4382,12 +4341,6 @@ GRANT ALL ON SEQUENCE "public"."user_roles_id_seq" TO "service_role";
 
 
 
-
-
-
-
-
-
 ALTER DEFAULT PRIVILEGES FOR ROLE "postgres" IN SCHEMA "public" GRANT ALL ON SEQUENCES TO "postgres";
 ALTER DEFAULT PRIVILEGES FOR ROLE "postgres" IN SCHEMA "public" GRANT ALL ON SEQUENCES TO "anon";
 ALTER DEFAULT PRIVILEGES FOR ROLE "postgres" IN SCHEMA "public" GRANT ALL ON SEQUENCES TO "authenticated";
@@ -4412,30 +4365,6 @@ ALTER DEFAULT PRIVILEGES FOR ROLE "postgres" IN SCHEMA "public" GRANT ALL ON TAB
 ALTER DEFAULT PRIVILEGES FOR ROLE "postgres" IN SCHEMA "public" GRANT ALL ON TABLES TO "anon";
 ALTER DEFAULT PRIVILEGES FOR ROLE "postgres" IN SCHEMA "public" GRANT ALL ON TABLES TO "authenticated";
 ALTER DEFAULT PRIVILEGES FOR ROLE "postgres" IN SCHEMA "public" GRANT ALL ON TABLES TO "service_role";
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 
 
