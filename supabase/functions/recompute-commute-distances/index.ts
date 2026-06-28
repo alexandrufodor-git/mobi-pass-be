@@ -24,10 +24,12 @@
 //   { company_id?: string, batch_size?: number, dry_run?: boolean, min_interval_ms?: number }
 //
 // Response:
-//   { scanned, computed, cleared, unchanged, dry_run }
+//   { scanned, computed, cleared, unchanged, refreshed, dry_run }
 //     computed   = rows written with a numeric distance
 //     cleared    = rows written NULL (missing home or office coords)
 //     unchanged  = rows whose distance already matched (no write)
+//     refreshed  = true when the current-week company_co2_stats were re-aggregated
+//                  after the backfill (false on dry runs / no-op runs)
 
 import "jsr:@supabase/functions-js/edge-runtime.d.ts"
 import { UserRoles, json } from "../_shared/constants.ts"
@@ -156,7 +158,25 @@ Deno.serve(async (req) => {
     if (rows.length < batchSize) break
   }
 
-  const counts = { scanned, computed, cleared, unchanged, dry_run: dryRun }
+  // Chain the weekly CO₂ aggregation so a single call yields correct stats:
+  // this loop just wrote commute_distance_km, and refresh_company_co2_stats
+  // reads those scalars for the current ISO week — same SQL the Mon–Fri cron
+  // runs. Doing it here removes the "backfill, then remember to refresh"
+  // ordering hazard (the deploy-time seed ran before any distance existed, so
+  // the first week was all zeros). Skipped on dry runs (nothing was written)
+  // and when nothing changed (the stats already reflect reality). Scoped to the
+  // affected company on an office-move recompute; all companies on a full
+  // backfill.
+  let refreshed = false
+  if (!dryRun && (computed > 0 || cleared > 0)) {
+    await db.rpc<null>(
+      "refresh_company_co2_stats",
+      body.company_id ? { p_company_ids: [body.company_id] } : {},
+    )
+    refreshed = true
+  }
+
+  const counts = { scanned, computed, cleared, unchanged, refreshed, dry_run: dryRun }
   console.log("[recompute-commute-distances] completed:", JSON.stringify(counts))
   return json(counts, 200)
 })

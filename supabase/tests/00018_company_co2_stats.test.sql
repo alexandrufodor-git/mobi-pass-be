@@ -1,12 +1,14 @@
 SET search_path TO extensions, public;
 
 -- ============================================================
--- pgTAP: Company CO₂ engine — refresh_company_co2_stats() (WEEKLY) + summary view + RLS
+-- pgTAP: Company CO₂ engine — refresh_company_co2_stats() (WEEKLY) + roll-up + RLS
 --
--- Migrations 20260627000001/2. Verifies the per-company WEEKLY upsert over the
+-- Migrations 20260627000001/2/4. Verifies the per-company WEEKLY upsert over the
 -- derived scalar employee_pii.commute_distance_km, the delivered+active
 -- lifecycle gate, the LEFT-JOIN-LATERAL zero row, idempotency, drop-to-zero,
--- the company_co2_summary roll-up view, and the HR-own-company RLS read policy.
+-- the all-time/last-week roll-up (inlined into refresh_company_metrics_co2 →
+-- company_metrics since migr 04; company_co2_summary view dropped), and the
+-- HR-own-company RLS read policy. Read-model RLS lives in 00019 (company_metrics).
 --
 -- Constants (skill references/co2-commute-engine.md):
 --   week_km      = commute_distance_km × 2 × days_in_office
@@ -22,9 +24,9 @@ SET search_path TO extensions, public;
 -- Company B: no riders → expects a zero row from the LEFT JOIN LATERAL.
 --
 --  T01 active_riders=1  T02 total_km=50  T03 kg=8.25  T04 company B zero row
---  V1 all_time_kg=13.25  V2 last_week_kg=5.0
+--  V1 co2_all_time_kg=13.25  V2 co2_last_week_kg=5.0  (roll-up → company_metrics)
 --  T05 idempotent rerun  T06/07 drop-to-zero
---  T08/09 table RLS   V3/V4 view RLS
+--  T08/09 table RLS
 -- ============================================================
 
 BEGIN;
@@ -90,7 +92,7 @@ BEGIN
 END;
 $$;
 
-SELECT plan(13);
+SELECT plan(10);
 
 -- Run the aggregation for the current week.
 SELECT public.refresh_company_co2_stats();
@@ -129,18 +131,15 @@ SELECT is(
   'T04: company with no qualifying riders upserts a zero row'
 );
 
--- ── Roll-up view: all-time sums weeks, last_week reads the prior week ──────────
+-- ── Roll-up (inlined into refresh_company_metrics_co2 → company_metrics, fired
+-- by the company_co2_stats trigger): all-time sums weeks. Windowed/last-week CO₂
+-- is no longer a column (dropped in migr 05) — it is served on read by the
+-- get_company_metrics RPC, covered in 00020.
 SELECT is(
-  (SELECT all_time_kg FROM public.company_co2_summary
+  (SELECT co2_all_time_kg FROM public.company_metrics
    WHERE company_id = current_setting('test.co_a_id')::uuid),
   13.25::numeric,
-  'V1: all_time_kg = this week 8.25 + prior week 5.0 = 13.25'
-);
-SELECT is(
-  (SELECT last_week_kg FROM public.company_co2_summary
-   WHERE company_id = current_setting('test.co_a_id')::uuid),
-  5.0::numeric,
-  'V2: last_week_kg = the prior completed week (5.0)'
+  'V1: co2_all_time_kg = this week 8.25 + prior week 5.0 = 13.25'
 );
 
 -- ── Idempotency: a second run does not double-count ───────────────────────────
@@ -177,7 +176,7 @@ SELECT is(
   'T07: kg_co2_saved also resets to 0 (no accrual after termination)'
 );
 
--- ── RLS: HR of company A reads only their own company's stats + summary ───────
+-- ── RLS: HR of company A reads only their own company's stats ─────────────────
 SET LOCAL ROLE authenticated;
 SELECT set_config('request.jwt.claims',
   json_build_object('sub', current_setting('test.hr_id'), 'role', 'authenticated', 'user_role', 'hr')::text,
@@ -190,14 +189,6 @@ SELECT ok(
 SELECT ok(
   NOT EXISTS(SELECT 1 FROM public.company_co2_stats WHERE company_id = current_setting('test.co_b_id')::uuid),
   'T09: HR cannot see another company''s CO₂ stats'
-);
-SELECT ok(
-  EXISTS(SELECT 1 FROM public.company_co2_summary WHERE company_id = current_setting('test.co_a_id')::uuid),
-  'V3: HR sees own-company summary row (view inherits RLS via security_invoker)'
-);
-SELECT ok(
-  NOT EXISTS(SELECT 1 FROM public.company_co2_summary WHERE company_id = current_setting('test.co_b_id')::uuid),
-  'V4: HR cannot see another company''s summary row'
 );
 
 RESET ROLE;

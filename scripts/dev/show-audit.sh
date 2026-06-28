@@ -7,7 +7,14 @@
 #   ./scripts/dev/show-audit.sh --prod [view]             # production, all companies
 #   ./scripts/dev/show-audit.sh --prod <uuid> [view]      # production, one company
 #
-# view: all (default) | imports | registers | invites | pii | notifications | follow
+# view: all (default) | imports | registers | invites | pii | notifications | diagnose | follow
+#
+# diagnose: cross-references each FAILED register_attempt against the actual
+#           pending invites by name, comparing the date-of-birth hash the caller
+#           typed vs the hash stored on the matching invite. This surfaces the
+#           "my date was wrong" case that match_pending_invite hides: a wrong
+#           date is filtered out before scoring, so the normal audit shows an
+#           empty candidate list with no reason.
 #
 # --prod requires the project to be linked: supabase link --project-ref <ref>
 
@@ -29,7 +36,7 @@ while [[ $# -gt 0 ]]; do
         shift
       fi
       ;;
-    all|imports|registers|invites|pii|notifications|follow)
+    all|imports|registers|invites|pii|notifications|diagnose|follow)
       VIEW="$1"
       shift
       ;;
@@ -186,6 +193,66 @@ LIMIT 20;
 SQL
 }
 
+show_diagnose() {
+  bar "Why did claims fail? (typed DOB hash vs. invite DOB hash, by name)"
+  printf '%s\n' "Each failed register_attempt is joined to same-company invites whose"
+  printf '%s\n' "name is trigram-similar. dob_check tells you if the date was the problem:"
+  printf '%s\n' "  DATE MATCH    → date was right (failure was something else: email/ambiguity)"
+  printf '%s\n' "  DATE MISMATCH → typed date hashes differently than the invite's stored date"
+  printf '%s\n' "  (no typed_dob) → caller sent no date at all"
+  RUN_SQL <<SQL
+SELECT
+  to_char(im.processed_at, 'HH24:MI:SS')                       AS time,
+  im.result_code                                               AS decision,
+  COALESCE(im.result_payload->>'first_norm','')
+    || ' ' || COALESCE(im.result_payload->>'last_norm','')     AS typed_name,
+  COALESCE(left(im.result_payload->>'dob_hash', 10), '-')      AS typed_dob,
+  pi.first_name || ' ' || pi.last_name                          AS invite_name,
+  COALESCE(left(pi.birth_date_hash, 10), '-')                  AS invite_dob,
+  CASE
+    WHEN im.result_payload->>'dob_hash' IS NULL THEN '(no typed_dob)'
+    WHEN pi.birth_date_hash IS NULL              THEN '(invite has no dob)'
+    WHEN pi.birth_date_hash = im.result_payload->>'dob_hash' THEN 'DATE MATCH'
+    ELSE 'DATE MISMATCH'
+  END                                                          AS dob_check,
+  -- Plain-English reason THIS name-matched invite did not rescue the attempt.
+  -- Mirrors match_pending_invite's gate: an invite is a candidate only while
+  -- pending AND (DOB hash matches OR typed email == derived_email). The typed
+  -- email is not audited (only its domain), so a DOB mismatch is reported as
+  -- gated-out "unless the email matched" — had it matched, this would have been
+  -- a candidate and the attempt would not read not_invited on its account.
+  CASE
+    WHEN pi.email IS NOT NULL
+      THEN 'EXCLUDED: invite already claimed (email set)'
+    WHEN im.result_payload->>'dob_hash' IS NULL
+      THEN 'GATED OUT: no DOB typed → never a candidate'
+    WHEN pi.birth_date_hash = im.result_payload->>'dob_hash'
+      THEN 'CANDIDATE: DOB ok → failed on email/ambiguity/threshold'
+    ELSE 'GATED OUT: DOB mismatch (unless typed email == derived)'
+  END                                                          AS verdict,
+  round(similarity(lower(pi.first_name),
+        COALESCE(im.result_payload->>'first_norm',''))::numeric, 2) AS first_sim,
+  round(similarity(lower(pi.last_name),
+        COALESCE(im.result_payload->>'last_norm',''))::numeric, 2)  AS last_sim,
+  CASE WHEN pi.email IS NULL THEN 'pending' ELSE 'claimed' END  AS invite_state,
+  CASE WHEN pi.derived_email IS NOT NULL THEN '✓' ELSE '-' END  AS has_derived
+FROM public.integration_messages im
+JOIN public.profile_invites pi
+  ON pi.company_id = im.company_id
+ AND (
+       similarity(lower(pi.first_name), COALESCE(im.result_payload->>'first_norm','')) > 0.3
+    OR similarity(lower(pi.last_name),  COALESCE(im.result_payload->>'last_norm',''))  > 0.3
+     )
+WHERE im.integration = 'reges'
+  AND im.operation   = 'register_attempt'
+  AND im.result_code <> 'claim'
+  AND im.company_id IS NOT NULL
+  AND ${CFILTER//company_id/im.company_id}
+ORDER BY im.processed_at DESC, last_sim DESC NULLS LAST, first_sim DESC NULLS LAST
+LIMIT 40;
+SQL
+}
+
 show_all() {
   show_imports
   show_registers
@@ -203,6 +270,7 @@ case "$VIEW" in
   invites)        show_invites ;;
   pii)            show_pii ;;
   notifications)  show_notifications ;;
+  diagnose)       show_diagnose ;;
   follow)
     while :; do
       clear
